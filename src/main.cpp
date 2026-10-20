@@ -1404,6 +1404,19 @@ int checkCredentials(const std::string& email, const std::string& password) {
   return -1;
 }
 
+// The BLE login's success reply for [u], decided only from the role stored in
+// the PLC's own user record — the login request carries no role, and none is
+// ever taken from the app:
+//   Admin    -> "AUTH_OK"
+//   Operator -> "AUTH_OK|Operator"
+// The app matches these exactly (no spaces, no other casing). Any other stored
+// role gets nullptr: that login is refused rather than defaulted to a role.
+static const char *authSuccessReply(const User &u) {
+  if (strcmp(u.role, "Admin") == 0)    return "AUTH_OK";
+  if (strcmp(u.role, "Operator") == 0) return "AUTH_OK|Operator";
+  return nullptr;
+}
+
 void startWiFi() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(wifiSsid, wifiPassword);
@@ -1589,7 +1602,12 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
     bool okCreds = (userIdx >= 0);
     bool okTime = okCreds && isUserAccessAllowed(users[userIdx]);
     bool okDevice = (deviceId.length() > 0 && deviceId.length() <= 40 && isDeviceRegistered(deviceId.c_str()));
-    bool ok = okCreds && okTime && okDevice;
+    // The role is read from this user's stored record, captured once here so
+    // the reply cannot differ from what was checked. A record whose role is
+    // neither "Admin" nor "Operator" has no reply and cannot sign in.
+    const char *okReply = okCreds ? authSuccessReply(users[userIdx]) : nullptr;
+    bool okRole = (okReply != nullptr);
+    bool ok = okCreds && okTime && okDevice && okRole;
     if (ok) {
       authenticated = true;
       strncpy(connectedUserEmail, email.c_str(), sizeof(connectedUserEmail) - 1);
@@ -1611,6 +1629,7 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
       if (!okCreds) Serial.printf("Authentication FAILED (bad credentials) — user: %s\n", email.c_str());
       if (okCreds && !okTime) Serial.printf("Authentication FAILED (outside allowed access time) — user: %s\n", email.c_str());
       if (!okDevice) Serial.printf("Authentication FAILED (unregistered device) — device: %s\n", deviceId.c_str());
+      if (okCreds && !okRole) Serial.printf("Authentication FAILED (stored role is not Admin or Operator) — user: %s\n", email.c_str());
 
       // Queue a LOGIN_FAIL entry for the SD event log (written from loop()).
       // The reason matches the AUTH_FAIL reply sent to the app. The email and
@@ -1624,7 +1643,10 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
         }
         return o;
       };
-      const char *failReason = !okCreds ? "BAD_CREDENTIALS" : (!okTime ? "OUT_OF_TIME" : "UNTRUSTED_DEVICE");
+      const char *failReason = !okCreds ? "BAD_CREDENTIALS"
+                             : !okTime ? "OUT_OF_TIME"
+                             : !okDevice ? "UNTRUSTED_DEVICE"
+                             : "INVALID_ROLE";
       pendingLoginFailDetail = String(failReason) + " - email: " + cleanForLog(email) + ", device: " + cleanForLog(deviceId);
       pendingLoginFailEvent  = true;
     }
@@ -1632,8 +1654,9 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
     // Encrypt and send response
     std::string reply;
     if (ok) {
-      // Success reply carries the logged-in user's role: "AUTH_OK| Admin" or "AUTH_OK| Operator"
-      reply = std::string("AUTH_OK| ") + users[userIdx].role;
+      // Success reply carries the logged-in user's role, from the PLC's own
+      // record: exactly "AUTH_OK" (Admin) or "AUTH_OK|Operator" (Operator).
+      reply = okReply;
     } else if (okCreds && !okTime) {
       // Credentials valid but this timed user is outside their access window
       reply = "AUTH_FAIL:OUT_OF_TIME";

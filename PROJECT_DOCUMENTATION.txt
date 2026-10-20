@@ -267,8 +267,12 @@ Main features
    Purpose: login handshake.
    PLC -> App (notify):
         * on connect (PLAIN TEXT): "AUTH_REQ:email|password|deviceid"
-        * encrypted replies: "AUTH_OK| <Role>" (e.g. "AUTH_OK| Admin"), "AUTH_FAIL",
-          "AUTH_FAIL:OUT_OF_TIME", "AUTH_FAIL:UNTRUSTED_DEVICE"
+        * encrypted replies, matched exactly by the app (no spaces):
+            "AUTH_OK"           - success, the user's stored role is Admin
+            "AUTH_OK|Operator"  - success, the user's stored role is Operator
+            "AUTH_FAIL", "AUTH_FAIL:OUT_OF_TIME", "AUTH_FAIL:UNTRUSTED_DEVICE"
+          The role is read from the PLC's own user record; the login request
+          carries none and the app cannot supply one.
         * also later "AUTH_FAIL:OUT_OF_TIME" (encrypted) when a timed user's
           window closes during a session
         * "AUTH_TIMEOUT" (plain) after 60 s without login
@@ -437,7 +441,7 @@ Main features
    |                                                |  checkCredentials()
    |                                                |  isUserAccessAllowed()
    |                                                |  isDeviceRegistered()
-   |<--- notify AUTH: Enc("AUTH_OK| <Role>" | "AUTH_FAIL" |
+   |<--- notify AUTH: Enc("AUTH_OK" | "AUTH_OK|Operator" | "AUTH_FAIL" |
    |         "AUTH_FAIL:OUT_OF_TIME" | "AUTH_FAIL:UNTRUSTED_DEVICE")
    |<--- notify STATUS: Enc("1,0,0,0,0")   (only after AUTH_OK)
    |                                                |
@@ -445,14 +449,18 @@ Main features
    |---- write DIGITAL: Enc("0,1,0,0,0") ---------->|
    |<--- notify STATUS on any E-STOP change ---------|
 
- Login succeeds only if ALL three are true:
+ Login succeeds only if ALL four are true:
    1. Credentials valid (okCreds)
    2. User allowed at this time (okTime - perpetual, or inside timed window
       and RTC clock available)
    3. Device ID registered in the Device Registry (okDevice, 1-40 chars)
+   4. The user's stored role is exactly "Admin" or "Operator" (okRole,
+      authSuccessReply()). Any other stored role is refused with AUTH_FAIL;
+      it is never defaulted to a role.
 
  Reply selection:
-   all OK                         -> AUTH_OK| Admin  or  AUTH_OK| Operator
+   all OK, stored role Admin      -> AUTH_OK
+   all OK, stored role Operator   -> AUTH_OK|Operator
    creds ok, time not allowed     -> AUTH_FAIL:OUT_OF_TIME
    creds ok, device unregistered  -> AUTH_FAIL:UNTRUSTED_DEVICE
    anything else                  -> AUTH_FAIL
@@ -482,7 +490,7 @@ Main features
  ---------   --------------  ---------------------------------  ----------
  PLC->App    AUTH            AUTH_REQ:email|password|deviceid   No
  App->PLC    AUTH            email|password|deviceid            Yes
- PLC->App    AUTH            AUTH_OK| <Role> / AUTH_FAIL[:reason]       Yes
+ PLC->App    AUTH            AUTH_OK / AUTH_OK|Operator / AUTH_FAIL[:reason]   Yes
  PLC->App    AUTH            AUTH_TIMEOUT                       No
  App->PLC    DIGITAL         estop,up,down,left,right  (0/1)    Yes
  PLC->App    STATUS          estop,up,down,left,right  (0/1)    Yes
