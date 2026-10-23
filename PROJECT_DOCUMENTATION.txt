@@ -389,7 +389,7 @@ Main features
    events_YYYY-MM.log files are not offered over BLE.
    Example:
      LOG_DAY|2026-11-02
-       -> LOG_LINE|1|2026-11-02 08:01:10,LOGIN,Ravi K (ravi@plc.com) logged in from device PHONE-001
+       -> LOG_LINE|1|2026-11-02 08:01:10,LOGIN,Ravi K (ravi@plc.com) logged in as Operator from device PHONE-001
        -> LOG_LINE|2|2026-11-02 08:01:11,CRANE_START,App cleared E-STOP by ravi@plc.com
        -> LOG_END|2|0
 
@@ -478,7 +478,7 @@ Main features
 
  On success:
    - authenticated = true, connectedUserEmail stored
-   - a LOGIN event is queued ("<name> (<email>) logged in from device <id>")
+   - a LOGIN event is queued ("<name> (<email>) logged in as <role> from device <id>")
    - the current E-STOP state is pushed to the app.
  On disconnect: LOGOUT event queued ("<name> (<email>) logged out").
 
@@ -757,7 +757,8 @@ Main features
  SD.open() exceptions (low heap) are caught and the entry is skipped.
 
  Event categories
-   LOGIN       "<name> (<email>) logged in from device <deviceId>"
+   LOGIN       "<name> (<email>) logged in as <role> from device <deviceId>"
+               role = Admin | Operator, from the PLC's stored user record.
    LOGOUT      "<name> (<email>) logged out"
    LOGIN_FAIL  failed BLE login: "<REASON> - email: <email>, device: <id>"
                REASON = BAD_CREDENTIALS | OUT_OF_TIME | UNTRUSTED_DEVICE.

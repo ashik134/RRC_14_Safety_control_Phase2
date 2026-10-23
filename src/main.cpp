@@ -1622,7 +1622,8 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
           break;
         }
       }
-      pendingLoginDetail = userName + " (" + String(email.c_str()) + ") logged in from device " + String(deviceId.c_str());
+      // okRole is part of ok, so the stored role here is exactly "Admin" or "Operator".
+      pendingLoginDetail = userName + " (" + String(email.c_str()) + ") logged in as " + String(users[userIdx].role) + " from device " + String(deviceId.c_str());
       pendingLoginEvent  = true;
     } else {
       authenticated = false;
