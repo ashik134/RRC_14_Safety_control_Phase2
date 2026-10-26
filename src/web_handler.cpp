@@ -1,6 +1,7 @@
 #include "web_handler.h"
 #include <Update.h>
 #include <SD.h>
+#include "web_logo.h"
 
 // Drop-in replacement for webServer.send(...), used everywhere in this file
 // instead of calling it directly.
@@ -24,11 +25,33 @@
 // digit milliseconds, so anything far beyond that is treated as proof the
 // peer is gone, and the connection is force-closed right then rather than
 // left to be retried again later.
-static void sendSafe(int code, const char* contentType = NULL, const String& content = String("")) {
+static void sendSafe(int code, const char *contentType = NULL, const String &content = String(""))
+{
   unsigned long writeStartMs = millis();
   webServer.send(code, contentType, content);
   unsigned long writeMs = millis() - writeStartMs;
-  if (writeMs > 300) {
+  if (writeMs > 300)
+  {
+    Serial.printf("Web: client write took %lums — treating connection as dead, closing it\n", writeMs);
+    webServer.client().stop();
+  }
+}
+
+// Same dead-client guard as sendSafe(), for a response streamed straight from
+// flash with send_P() — used for the (large) stylesheet and the logo so they
+// are never copied into a RAM String first. Pass `length` for binary data: the
+// 3-argument send_P() measures the content with strlen_P(), which would stop at
+// the first 0x00 byte of a PNG.
+static void sendSafeP(int code, const char *contentType, const char *content, size_t length = 0)
+{
+  unsigned long writeStartMs = millis();
+  if (length > 0)
+    webServer.send_P(code, contentType, content, length);
+  else
+    webServer.send_P(code, contentType, content);
+  unsigned long writeMs = millis() - writeStartMs;
+  if (writeMs > 300)
+  {
     Serial.printf("Web: client write took %lums — treating connection as dead, closing it\n", writeMs);
     webServer.client().stop();
   }
@@ -38,8 +61,8 @@ static void sendSafe(int code, const char* contentType = NULL, const String& con
 struct WebSession
 {
   String token;
-  String role;      // "Admin" / "Operator"
-  String userEmail; // empty = web admin, else BLE user email
+  String role;             // "Admin" / "Operator"
+  String userEmail;        // empty = web admin, else BLE user email
   bool timeExempt = false; // true for admin "Login As": skips the timed-access window check
 };
 static WebSession sessions[MAX_SESSIONS];
@@ -232,14 +255,6 @@ static String formatDateTime(uint32_t ts, bool forInput = false)
   return String(buf);
 }
 
-// "Perpetual" or "Timed 2026-03-01 09:00 to 2026-03-05 17:00"
-static String accessLabel(const User &u)
-{
-  if (u.accessType != ACCESS_TIMED)
-    return "Perpetual";
-  return "Timed " + formatDateTime(u.startTs) + " to " + formatDateTime(u.endTs);
-}
-
 // Parses "YYYY-MM-DDTHH:MM" (from <input type='datetime-local'>) into seconds
 // since 1970, treating the fields as literal RTC date/time (no time zone).
 bool parseDateTimeLocal(const String &s, uint32_t &ts)
@@ -286,29 +301,6 @@ static String readAccessFromForm(User &u)
   return "";
 }
 
-// Access Type dropdown + From/To date-time inputs (shown only for Timed).
-// `u` is null on the Add form (defaults to Perpetual).
-static String accessFormFields(const User *u)
-{
-  bool timed = u && u->accessType == ACCESS_TIMED;
-  String selStyle = "width:100%;padding:9px 12px;border:1px solid #E2E8F0;"
-                    "border-radius:7px;font-size:14.5px;color:#1E293B;outline:none;background:#fff;";
-  String h = "<div class='form-group'><label>Access</label>";
-  h += "<select name='accessType' id='accessType' style='" + selStyle + "' "
-       "onchange=\"document.getElementById('timedBox').style.display=this.value==='timed'?'flex':'none';"
-       "document.getElementById('fromTime').required=document.getElementById('toTime').required=this.value==='timed';\">";
-  h += "<option value='perpetual'" + String(timed ? "" : " selected") + ">Perpetual (any time)</option>";
-  h += "<option value='timed'" + String(timed ? " selected" : "") + ">Timed (only between a start and end date/time)</option>";
-  h += "</select></div>";
-  h += "<div class='form-group' id='timedBox' style='display:" + String(timed ? "flex" : "none") + ";gap:14px;flex-wrap:wrap;'>";
-  h += "<div style='flex:1;min-width:200px;'><label>From (date &amp; time)</label><input type='datetime-local' name='fromTime' id='fromTime' value='" +
-       (timed ? formatDateTime(u->startTs, true) : String("")) + "'" + (timed ? " required" : "") + "></div>";
-  h += "<div style='flex:1;min-width:200px;'><label>To (date &amp; time)</label><input type='datetime-local' name='toTime' id='toTime' value='" +
-       (timed ? formatDateTime(u->endTs, true) : String("")) + "'" + (timed ? " required" : "") + "></div>";
-  h += "</div>";
-  return h;
-}
-
 // Allocate a slot — prefers empty, else evicts round-robin
 static int allocSessionSlot()
 {
@@ -322,171 +314,858 @@ static int allocSessionSlot()
   return slot;
 }
 
+// ============================================================
+//  Stylesheet  (GET /style.css — streamed straight from flash)
+// ============================================================
+// Bump CSS_VER whenever HTML_STYLE changes: it is both the ?v= on every page's
+// <link> and the ETag, so browsers drop their cached copy.
+//
+// Icons are Feather-style 24x24 outline glyphs inlined as data-URI masks, so the
+// UI needs no network (the PLC's own Wi-Fi has no internet) and every icon takes
+// the colour of its text. Markup: <i class='ic ic-home'></i>.
+#define CSS_VER "5"
+// Bump LOGO_VER whenever src/web_logo.h is regenerated (tools/make_web_logo.py).
+#define LOGO_VER "1"
+#define SVG_OPEN "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E"
+#define SVG_CLOSE "%3C/svg%3E\")"
+#define SVG_ICON(name, shapes) ".ic-" name "{--ico:" SVG_OPEN shapes SVG_CLOSE "}\n"
+#define S_PATH(d) "%3Cpath d='" d "'/%3E"
+#define S_POLY(p) "%3Cpolyline points='" p "'/%3E"
+#define S_GON(p) "%3Cpolygon points='" p "'/%3E"
+#define S_LINE(x1, y1, x2, y2) "%3Cline x1='" #x1 "' y1='" #y1 "' x2='" #x2 "' y2='" #y2 "'/%3E"
+#define S_CIRC(cx, cy, r) "%3Ccircle cx='" #cx "' cy='" #cy "' r='" #r "'/%3E"
+#define S_RECT(x, y, w, h, rx) "%3Crect x='" #x "' y='" #y "' width='" #w "' height='" #h "' rx='" #rx "'/%3E"
+#define S_ELL(cx, cy, rx, ry) "%3Cellipse cx='" #cx "' cy='" #cy "' rx='" #rx "' ry='" #ry "'/%3E"
+
 static const char HTML_STYLE[] =
-    ":root{--brand:#1565C0;--brand-dark:#0B3D91;--brand-ink:#0F2E5C;--border:#E2E8F0;"
-    "--text:#1E293B;--text-soft:#64748B;--text-faint:#94A3B8;--bg:#F7F9FC;"
-    "--surface:#fff;--danger:#DC2626;--danger-dark:#B91C1C;"
-    "--shadow-sm:0 1px 2px rgba(15,23,42,.05);--shadow-md:0 4px 16px rgba(15,23,42,.08);}"
-    "*{box-sizing:border-box;margin:0;padding:0;}"
-    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;"
-    "background:var(--bg);color:var(--text);min-height:100vh;font-size:15px;line-height:1.5;"
-    "-webkit-font-smoothing:antialiased;}"
-    ".topbar{background:var(--brand-dark);display:flex;align-items:center;"
-    "justify-content:space-between;padding:0 28px;height:60px;box-shadow:0 1px 3px rgba(0,0,0,.18);}"
-    ".brand{color:#fff;font-size:19px;font-weight:700;letter-spacing:.5px;}"
-    ".topbar nav a{color:rgba(255,255,255,.82);text-decoration:none;margin-left:18px;font-size:14px;"
-    "padding:6px 12px;border-radius:6px;transition:background .2s;}"
-    ".topbar nav a:hover{background:rgba(255,255,255,.14);color:#fff;}"
-    ".container{max-width:760px;margin:28px auto;padding:0 16px;}"
-    ".layout{display:flex;min-height:calc(100vh - 60px);}"
-    ".sidebar{width:232px;background:var(--surface);border-right:1px solid var(--border);"
-    "flex-shrink:0;padding:16px 0;}"
-    ".sidebar-section{padding:16px 20px 8px;font-size:11px;font-weight:700;color:var(--text-faint);"
-    "text-transform:uppercase;letter-spacing:.6px;}"
-    ".sidebar-item{display:flex;align-items:center;gap:11px;padding:10px 20px;cursor:pointer;"
-    "color:var(--text-soft);font-size:14.5px;font-weight:500;border-left:3px solid transparent;"
-    "transition:background .15s,color .15s,border-color .15s;user-select:none;}"
-    ".sidebar-item:hover{background:#F1F5F9;color:var(--text);}"
-    ".sidebar-item.active{background:#EFF6FF;color:var(--brand-dark);"
-    "border-left-color:var(--brand);font-weight:600;}"
-    ".sidebar-icon{font-size:17px;width:20px;text-align:center;opacity:.85;}"
-    ".main-content{flex:1;padding:28px 32px;background:var(--bg);overflow-y:auto;}"
-    ".tab-panel{display:none;}"
-    ".tab-panel.active{display:block;}"
-    ".section-title{font-size:19px;font-weight:700;color:var(--text);margin-bottom:4px;"
-    "letter-spacing:-.2px;}"
-    ".section-sub{font-size:13.5px;color:var(--text-soft);margin-bottom:20px;}"
-    ".divider{border:none;border-top:1px solid var(--border);margin:24px 0;}"
-    ".page-title{margin-bottom:20px;}"
-    ".page-title h1{color:var(--text);font-size:21px;font-weight:700;letter-spacing:-.2px;}"
-    ".subtitle{color:var(--text-soft);font-size:13.5px;margin-top:3px;}"
-    ".card{background:var(--surface);border:1px solid var(--border);border-radius:10px;"
-    "box-shadow:var(--shadow-sm);padding:24px 26px;margin-bottom:20px;}"
-    "table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);"
-    "border-radius:10px;overflow:hidden;box-shadow:var(--shadow-sm);margin-bottom:16px;}"
-    "thead tr{background:var(--brand-ink);}"
-    "thead th{color:rgba(255,255,255,.94);padding:11px 16px;font-size:12px;font-weight:600;"
-    "text-align:left;text-transform:uppercase;letter-spacing:.5px;}"
-    "tbody tr{border-bottom:1px solid var(--border);transition:background .15s;}"
-    "tbody tr:last-child td{border-bottom:none;}"
-    "tbody tr:hover{background:#F8FAFC;}"
-    "td{padding:11px 16px;color:var(--text);font-size:14px;}"
-    ".btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;border-radius:7px;"
-    "cursor:pointer;font-size:14px;font-weight:600;text-decoration:none;transition:all .15s;line-height:1.4;}"
-    ".btn-primary{background:var(--brand);color:#fff;}"
-    ".btn-primary:hover{background:var(--brand-dark);box-shadow:0 2px 8px rgba(11,61,145,.28);}"
-    ".btn-outline{background:var(--surface);color:var(--brand);border:1px solid #C7D7EE;}"
-    ".btn-outline:hover{background:#EFF6FF;border-color:var(--brand);}"
-    ".btn-edit{background:var(--surface);color:var(--brand);border:1px solid #C7D7EE;}"
-    ".btn-edit:hover{background:#EFF6FF;border-color:var(--brand);}"
-    ".btn-danger{background:var(--danger);color:#fff;}"
-    ".btn-danger:hover{background:var(--danger-dark);box-shadow:0 2px 8px rgba(185,28,28,.28);}"
-    ".btn-cancel{background:var(--surface);color:var(--text-soft);border:1px solid var(--border);}"
-    ".btn-cancel:hover{background:#F1F5F9;}"
-    ".action-bar{display:flex;gap:10px;margin-bottom:20px;}"
-    ".form-group{margin-bottom:16px;}"
-    ".form-group label{display:block;font-size:12.5px;font-weight:700;color:var(--text-soft);"
-    "text-transform:uppercase;letter-spacing:.4px;margin-bottom:7px;}"
-    ".form-group input{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:7px;"
-    "font-size:14.5px;color:var(--text);background:var(--surface);outline:none;"
-    "transition:border .2s,box-shadow .2s;}"
-    ".form-group input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(21,101,192,.12);}"
-    ".form-actions{margin-top:22px;display:flex;gap:10px;}"
-    ".badge{display:inline-block;background:#EFF6FF;color:var(--brand-dark);"
-    "font-size:12.5px;font-weight:600;padding:4px 11px;border-radius:20px;}"
-    ".alert{padding:12px 16px;border-radius:8px;font-size:14px;margin-bottom:16px;line-height:1.5;}"
-    ".alert-info{background:#EFF6FF;color:var(--brand-ink);border-left:3px solid var(--brand);}"
-    ".alert-danger{background:#FEF2F2;color:#991B1B;border-left:3px solid var(--danger);}"
-    ".del-box{text-align:center;padding:10px 0 20px;}"
-    ".del-icon{font-size:38px;margin-bottom:12px;}"
-    ".del-msg{color:var(--text-soft);font-size:15px;margin-bottom:4px;}"
-    ".del-email{font-weight:700;color:var(--text);font-size:15px;margin-bottom:22px;}"
-    ".del-btns{display:flex;justify-content:center;gap:12px;}"
-    ".table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px;margin-bottom:16px;}"
-    /* ---- Responsive ---- */
-    "@media(max-width:900px){"
-    ".sidebar{width:196px;}"
-    ".main-content{padding:20px 18px;}"
-    "}"
-    ".main-content{min-width:0;}"
-    "img,input,select,textarea{max-width:100%;}"
-    "@media(max-width:768px){"
-    ".topbar{padding:0 14px;height:54px;}"
-    ".brand{font-size:16px;}"
-    ".layout{flex-direction:column;min-height:unset;}"
-    ".sidebar{width:100%;border-right:none;border-bottom:1px solid var(--border);"
-    "padding:0;display:flex;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;}"
-    ".sidebar-section{display:none;}"
-    ".sidebar-item{flex:0 0 auto;white-space:nowrap;padding:12px 14px;border-left:none;"
-    "border-bottom:3px solid transparent;justify-content:center;font-size:13.5px;}"
-    ".sidebar-item.active{border-left:none;border-bottom-color:var(--brand);}"
-    ".sidebar-icon{display:none;}"
-    ".main-content{padding:14px 10px;overflow-x:hidden;}"
-    ".card{padding:16px 14px;}"
-    ".section-title{font-size:17px;}"
-    "table{font-size:13px;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;}"
-    "td,thead th{padding:8px 8px;}"
-    ".btn{padding:7px 12px;font-size:13px;}"
-    ".action-bar{flex-wrap:wrap;}"
-    ".form-actions{flex-wrap:wrap;}"
-    ".del-btns{flex-wrap:wrap;}"
-    ".home-grid{grid-template-columns:1fr;}"
-    "}"
-    /* ---- User dropdown menu ---- */
-    ".user-menu{position:relative;}"
-    ".user-btn{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.1);"
-    "color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:8px;"
-    "padding:6px 12px;cursor:pointer;font-size:13.5px;font-weight:600;"
-    "font-family:inherit;outline:none;transition:background .2s;}"
-    ".user-btn:hover{background:rgba(255,255,255,.18);}"
-    ".user-avatar{width:24px;height:24px;border-radius:50%;background:rgba(255,255,255,.22);"
-    "display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;}"
-    ".user-dropdown{display:none;position:absolute;right:0;top:calc(100% + 8px);"
-    "background:#fff;border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-md);"
-    "min-width:190px;z-index:999;overflow:hidden;}"
-    ".user-dropdown.open{display:block;}"
-    ".user-dropdown a{display:flex;align-items:center;gap:10px;padding:11px 16px;"
-    "color:var(--text);text-decoration:none;font-size:14px;font-weight:500;"
-    "border-bottom:1px solid var(--bg);transition:background .15s;}"
-    ".user-dropdown a:last-child{border-bottom:none;}"
-    ".user-dropdown a:hover{background:var(--bg);color:var(--brand-dark);}"
-    ".dd-danger{color:var(--danger) !important;}"
-    ".user-dropdown .dd-danger:hover{background:#FEF2F2;color:var(--danger-dark) !important;}"
-    "@media(max-width:660px){"
-    ".user-btn .uname{display:none;}"
-    ".user-btn .arr{display:none;}"
-    "}"
-    /* ---- Home Overview Cards ---- */
-    ".home-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:24px;}"
-    ".home-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;"
-    "box-shadow:var(--shadow-sm);padding:22px 24px;border-top:3px solid #E2E8F0;}"
-    ".home-card-title{font-size:11px;font-weight:700;color:var(--text-faint);text-transform:uppercase;"
-    "letter-spacing:.8px;margin-bottom:12px;}"
-    ".home-val{font-size:25px;font-weight:700;color:var(--text);margin-bottom:4px;letter-spacing:-.3px;}"
-    ".home-sub{font-size:13px;color:var(--text-soft);}"
-    ".ble-pill{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;"
-    "border-radius:20px;font-size:14px;font-weight:600;}"
-    ".ble-pill-on{background:#ECFDF3;color:#166534;}"
-    ".ble-pill-off{background:#F1F5F9;color:var(--text-soft);}"
-    ".ble-pill-wait{background:#FFF7ED;color:#C2410C;}"
-    ".ble-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}"
-    ".ble-dot-on{background:#16A34A;box-shadow:0 0 5px rgba(22,163,74,.5);}"
-    ".ble-dot-off{background:#CBD5E1;}"
-    ".ble-dot-wait{background:#EA580C;box-shadow:0 0 5px rgba(234,88,12,.5);}"
-    ".motion-tag{display:inline-block;padding:5px 12px;border-radius:16px;"
-    "font-size:13px;font-weight:600;margin:2px 3px;}"
-    ".tag-up{background:#EFF6FF;color:var(--brand-dark);}"
-    ".tag-down{background:#ECFEFF;color:#0E7490;}"
-    ".tag-estop{background:#FEF2F2;color:#991B1B;}"
-    ".tag-idle{background:#F1F5F9;color:var(--text-soft);}"
-    "@media(max-width:660px){.home-grid{grid-template-columns:1fr;}}"
-    /* ---- Output Config select ---- */
-    ".oc-select{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:7px;"
-    "font-size:14px;color:var(--text);outline:none;background:var(--surface);"
-    "transition:border .2s,box-shadow .2s;}"
-    ".oc-select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(21,101,192,.12);}"
-    ".oc-row td{vertical-align:middle;padding:12px 16px;}"
-    ".oc-motion{font-size:14px;font-weight:600;color:var(--text);}";
+    R"CSS(:root{--brand:#1565C0;--brand-dark:#0B3D91;--brand-ink:#0F2E5C;--brand-50:#EFF6FF;--brand-100:#DBEAFE;--brand-200:#BFDBFE;
+--ink:#0F172A;--text:#1E293B;--soft:#475569;--faint:#64748B;--line:#E2E8F0;--line-2:#CBD5E1;--bg:#F1F5F9;--tint:#F8FAFC;
+--ok:#16A34A;--ok-bg:#ECFDF3;--ok-ink:#166534;--ok-line:#BBF7D0;
+--warn:#EA580C;--warn-bg:#FFF7ED;--warn-ink:#9A3412;--warn-line:#FED7AA;
+--danger:#DC2626;--danger-dark:#B91C1C;--danger-bg:#FEF2F2;--danger-ink:#991B1B;--danger-line:#FECACA;
+--topbar:60px;--side:252px;--fs-input:14.5px;
+--shadow-sm:0 1px 2px rgba(15,23,42,.06),0 1px 1px rgba(15,23,42,.03);--shadow-md:0 10px 28px rgba(15,23,42,.14);--shadow-lg:0 24px 60px rgba(2,12,40,.38);
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+html{-webkit-text-size-adjust:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--brand)}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+.grow{flex:1}
+.ic{display:inline-block;flex:none;width:18px;height:18px;vertical-align:-3px;background-color:currentColor;-webkit-mask-image:var(--ico);mask-image:var(--ico);-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:contain;mask-size:contain}
+)CSS"
+    // ---- icon set ----
+    SVG_ICON("home", S_PATH("M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z") S_POLY("9 22 9 12 15 12 15 22"))
+        SVG_ICON("users", S_PATH("M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2") S_CIRC(9, 7, 4) S_PATH("M23 21v-2a4 4 0 0 0-3-3.87") S_PATH("M16 3.13a4 4 0 0 1 0 7.75"))
+            SVG_ICON("user", S_PATH("M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2") S_CIRC(12, 7, 4))
+                SVG_ICON("phone", S_RECT(5, 2, 14, 20, 2) S_LINE(12, 18, 12.01, 18))
+                    SVG_ICON("cloud", S_POLY("16 16 12 12 8 16") S_LINE(12, 12, 12, 21) S_PATH("M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"))
+                        SVG_ICON("folder", S_PATH("M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"))
+                            SVG_ICON("file", S_PATH("M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z") S_POLY("14 2 14 8 20 8") S_LINE(16, 13, 8, 13) S_LINE(16, 17, 8, 17))
+                                SVG_ICON("sliders", S_LINE(4, 21, 4, 14) S_LINE(4, 10, 4, 3) S_LINE(12, 21, 12, 12) S_LINE(12, 8, 12, 3) S_LINE(20, 21, 20, 16) S_LINE(20, 12, 20, 3) S_LINE(1, 14, 7, 14) S_LINE(9, 8, 15, 8) S_LINE(17, 16, 23, 16))
+                                    SVG_ICON("cpu", S_RECT(4, 4, 16, 16, 2) S_RECT(9, 9, 6, 6, 0) S_LINE(9, 1, 9, 4) S_LINE(15, 1, 15, 4) S_LINE(9, 20, 9, 23) S_LINE(15, 20, 15, 23) S_LINE(20, 9, 23, 9) S_LINE(20, 14, 23, 14) S_LINE(1, 9, 4, 9) S_LINE(1, 14, 4, 14))
+                                        SVG_ICON("wifi", S_PATH("M5 12.55a11 11 0 0 1 14.08 0") S_PATH("M1.42 9a16 16 0 0 1 21.16 0") S_PATH("M8.53 16.11a6 6 0 0 1 6.95 0") S_LINE(12, 20, 12.01, 20))
+                                            SVG_ICON("clock", S_CIRC(12, 12, 10) S_POLY("12 6 12 12 16 14"))
+                                                SVG_ICON("logout", S_PATH("M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4") S_POLY("16 17 21 12 16 7") S_LINE(21, 12, 9, 12))
+                                                    SVG_ICON("login", S_PATH("M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4") S_POLY("10 17 15 12 10 7") S_LINE(15, 12, 3, 12))
+                                                        SVG_ICON("key", S_PATH("M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"))
+                                                            SVG_ICON("plus", S_LINE(12, 5, 12, 19) S_LINE(5, 12, 19, 12))
+                                                                SVG_ICON("edit", S_PATH("M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"))
+                                                                    SVG_ICON("trash", S_POLY("3 6 5 6 21 6") S_PATH("M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6") S_LINE(10, 11, 10, 17) S_LINE(14, 11, 14, 17) S_PATH("M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"))
+                                                                        SVG_ICON("download", S_PATH("M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4") S_POLY("7 10 12 15 17 10") S_LINE(12, 15, 12, 3))
+                                                                            SVG_ICON("upload", S_PATH("M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4") S_POLY("17 8 12 3 7 8") S_LINE(12, 3, 12, 15))
+                                                                                SVG_ICON("check", S_POLY("20 6 9 17 4 12"))
+                                                                                    SVG_ICON("check-circle", S_PATH("M22 11.08V12a10 10 0 1 1-5.93-9.14") S_POLY("22 4 12 14.01 9 11.01"))
+                                                                                        SVG_ICON("alert", S_PATH("M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z") S_LINE(12, 9, 12, 13) S_LINE(12, 17, 12.01, 17))
+                                                                                            SVG_ICON("alert-circle", S_CIRC(12, 12, 10) S_LINE(12, 8, 12, 12) S_LINE(12, 16, 12.01, 16))
+                                                                                                SVG_ICON("info", S_CIRC(12, 12, 10) S_LINE(12, 16, 12, 12) S_LINE(12, 8, 12.01, 8))
+                                                                                                    SVG_ICON("left", S_LINE(19, 12, 5, 12) S_POLY("12 19 5 12 12 5"))
+                                                                                                        SVG_ICON("right", S_LINE(5, 12, 19, 12) S_POLY("12 5 19 12 12 19"))
+                                                                                                            SVG_ICON("up", S_LINE(12, 19, 12, 5) S_POLY("5 12 12 5 19 12"))
+                                                                                                                SVG_ICON("down", S_LINE(12, 5, 12, 19) S_POLY("19 12 12 19 5 12"))
+                                                                                                                    SVG_ICON("chev", S_POLY("6 9 12 15 18 9"))
+                                                                                                                        SVG_ICON("menu", S_LINE(3, 12, 21, 12) S_LINE(3, 6, 21, 6) S_LINE(3, 18, 21, 18))
+                                                                                                                            SVG_ICON("eye", S_PATH("M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z") S_CIRC(12, 12, 3))
+                                                                                                                                SVG_ICON("eye-off", S_PATH("M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24") S_LINE(1, 1, 23, 23))
+                                                                                                                                    SVG_ICON("shield", S_PATH("M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"))
+                                                                                                                                        SVG_ICON("bluetooth", S_POLY("6.5 6.5 17.5 17.5 12 23 12 1 17.5 6.5 6.5 17.5"))
+                                                                                                                                            SVG_ICON("database", S_ELL(12, 5, 9, 3) S_PATH("M21 12c0 1.66-4 3-9 3s-9-1.34-9-3") S_PATH("M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"))
+                                                                                                                                                SVG_ICON("octagon", S_GON("7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2") S_LINE(12, 8, 12, 12) S_LINE(12, 16, 12.01, 16))
+                                                                                                                                                    SVG_ICON("activity", S_POLY("22 12 18 12 15 21 9 3 6 12 2 12"))
+                                                                                                                                                        R"CSS(
+/* ---- top bar ---- */
+.topbar{position:sticky;top:0;z-index:70;height:var(--topbar);display:flex;align-items:center;gap:12px;padding:0 22px;background:linear-gradient(90deg,var(--brand-ink),var(--brand-dark));color:#fff;box-shadow:0 2px 10px rgba(11,36,71,.28)}
+.menu-btn{display:none;width:42px;height:42px;margin-left:-8px;border:0;border-radius:11px;background:transparent;color:#fff;align-items:center;justify-content:center}
+.menu-btn .ic{width:24px;height:24px}
+.menu-btn:hover{background:rgba(255,255,255,.12)}
+.brand{display:flex;align-items:center;gap:11px;min-width:0;color:#fff;text-decoration:none}
+.brand-logo{display:block;flex:none;width:40px;height:40px;filter:drop-shadow(0 2px 6px rgba(0,0,0,.32))}
+.brand-text{min-width:0}
+.brand-name{display:block;font-size:17px;font-weight:700;letter-spacing:.6px;line-height:1.1;white-space:nowrap}
+.brand-sub{display:block;margin-top:2px;font-size:11px;font-weight:500;letter-spacing:.4px;color:rgba(255,255,255,.66);white-space:nowrap}
+.user-menu{position:relative}
+.user-btn{display:flex;align-items:center;gap:10px;height:44px;padding:0 12px 0 6px;border:1px solid rgba(255,255,255,.22);border-radius:13px;background:rgba(255,255,255,.08);color:#fff;transition:background .15s}
+.user-btn:hover,.user-btn[aria-expanded=true]{background:rgba(255,255,255,.17)}
+.user-btn .ic{width:15px;height:15px;opacity:.8}
+.avatar{flex:none;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#60A5FA,#2563EB);color:#fff;font-size:13.5px;font-weight:700}
+.user-meta{display:flex;flex-direction:column;align-items:flex-start;min-width:0;max-width:210px;line-height:1.2;text-align:left}
+.user-meta b{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;font-weight:600}
+.user-meta small{font-size:11px;font-weight:500;color:rgba(255,255,255,.68)}
+.user-dropdown{display:none;position:absolute;right:0;top:calc(100% + 10px);width:270px;overflow:hidden;background:#fff;color:var(--text);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-md)}
+.user-dropdown.open{display:block}
+.dd-head{padding:15px 16px;background:var(--tint);border-bottom:1px solid var(--line)}
+.dd-head b{display:block;font-size:14.5px;overflow-wrap:anywhere}
+.dd-head small{display:block;margin:1px 0 9px;font-size:12.5px;color:var(--faint);overflow-wrap:anywhere}
+.user-dropdown a{display:flex;align-items:center;gap:12px;padding:12px 16px;color:var(--text);font-size:14px;font-weight:500;text-decoration:none}
+.user-dropdown a .ic{color:var(--faint)}
+.user-dropdown a:hover{background:var(--tint)}
+.user-dropdown a.dd-danger,.user-dropdown a.dd-danger .ic{color:var(--danger-dark)}
+.user-dropdown a.dd-danger:hover{background:var(--danger-bg)}
+/* ---- layout ---- */
+.layout{display:flex;align-items:flex-start;min-height:calc(100vh - var(--topbar))}
+.sidebar{position:sticky;top:var(--topbar);flex:0 0 var(--side);width:var(--side);height:calc(100vh - var(--topbar));overflow-y:auto;display:flex;flex-direction:column;padding:14px 12px;background:#fff;border-right:1px solid var(--line)}
+.nav-title{padding:18px 12px 6px;font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.nav-title:first-child{padding-top:6px}
+.nav-link{position:relative;display:flex;align-items:center;gap:12px;margin-bottom:2px;padding:10px 12px;border-radius:10px;color:var(--soft);font-size:14.5px;font-weight:500;text-decoration:none;transition:background .15s,color .15s}
+.nav-link .ic{width:19px;height:19px;color:var(--faint);transition:color .15s}
+.nav-link:hover{background:#F1F5F9;color:var(--text)}
+.nav-link:hover .ic{color:var(--soft)}
+.nav-link.active{background:var(--brand-50);color:var(--brand-dark);font-weight:600}
+.nav-link.active .ic{color:var(--brand)}
+.nav-link.active::before{content:'';position:absolute;left:-12px;top:9px;bottom:9px;width:3px;border-radius:0 3px 3px 0;background:var(--brand)}
+.side-foot{margin-top:auto;padding:16px 12px 2px;border-top:1px solid var(--line);font-size:12px;line-height:1.45;color:var(--faint)}
+.side-foot b{display:block;font-weight:600;color:var(--soft)}
+.scrim{display:none}
+.main-content{flex:1;min-width:0;padding:30px 36px 56px;transition:opacity .15s}
+.main-content.loading{opacity:.5;pointer-events:none}
+.busy-line{display:none;position:fixed;left:0;right:0;top:var(--topbar);height:3px;z-index:65;overflow:hidden;background:var(--brand-100)}
+.busy-line::before{content:'';display:block;width:35%;height:100%;background:var(--brand);animation:slide 1s ease-in-out infinite}
+body.busy .busy-line{display:block}
+@keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+.page{max-width:1120px}
+.page-narrow{max-width:720px}
+.page-head{display:flex;align-items:center;flex-wrap:wrap;gap:14px;margin-bottom:24px}
+.page-icon{flex:none;width:46px;height:46px;border-radius:13px;display:grid;place-items:center;background:var(--brand-50);color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand-100)}
+.page-icon .ic{width:23px;height:23px}
+.page-title{flex:1 1 220px;min-width:0}
+.page-title h1{font-size:23px;line-height:1.2;font-weight:700;letter-spacing:-.3px;color:var(--ink)}
+.page-title p{margin-top:3px;font-size:14px;color:var(--soft)}
+.head-actions{display:flex;flex-wrap:wrap;gap:10px}
+/* ---- cards ---- */
+.card{margin-bottom:20px;padding:24px;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-sm)}
+.card-flush{padding:0;overflow:hidden}
+.card-head{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.card-head h2,.section-h{font-size:15px;font-weight:700;color:var(--ink)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:20px;margin-bottom:20px}
+.grid>.card{margin-bottom:0}
+.stat{display:flex;flex-direction:column;gap:16px}
+.stat-head{display:flex;align-items:center;gap:13px}
+.stat-icon{flex:none;width:42px;height:42px;border-radius:12px;display:grid;place-items:center;background:var(--brand-50);color:var(--brand)}
+.stat-icon.warn{background:var(--warn-bg);color:var(--warn)}
+.stat-icon .ic{width:21px;height:21px}
+.stat-title{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.stat-sub{font-size:14px;color:var(--soft)}
+.meta{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:14px}
+.meta-k{color:var(--faint)}
+.meta-v{font-weight:600;overflow-wrap:anywhere}
+.pill{display:inline-flex;align-items:center;gap:9px;padding:6px 15px 6px 12px;border-radius:999px;font-size:14px;font-weight:600}
+.pill .dot{width:9px;height:9px;border-radius:50%;background:currentColor}
+.pill-on{background:var(--ok-bg);color:var(--ok-ink)}
+.pill-on .dot{background:var(--ok);box-shadow:0 0 0 4px rgba(22,163,74,.2)}
+.pill-wait{background:var(--warn-bg);color:var(--warn-ink)}
+.pill-wait .dot{background:var(--warn);box-shadow:0 0 0 4px rgba(234,88,12,.2);animation:pulse 1.2s ease-in-out infinite}
+.pill-off{background:#F1F5F9;color:var(--soft)}
+.pill-off .dot{background:#94A3B8}
+@keyframes pulse{50%{opacity:.35}}
+.motion-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.mot{display:flex;flex-direction:column;align-items:center;gap:6px;padding:13px 4px;border:1px solid var(--line);border-radius:12px;background:var(--tint);color:var(--faint);font-size:12px;font-weight:700;letter-spacing:.05em;transition:background .2s,color .2s,box-shadow .2s}
+.mot .ic{width:22px;height:22px;opacity:.65}
+.mot.on{background:var(--brand);border-color:var(--brand);color:#fff;box-shadow:0 4px 14px rgba(21,101,192,.38)}
+.mot.on .ic{opacity:1}
+.mot-estop{grid-column:1/-1;flex-direction:row;justify-content:center;gap:10px;padding:13px 8px}
+.mot-estop span::after{content:'\2002\00b7\2002 Clear';font-weight:600;letter-spacing:0}
+.mot-estop.on span::after{content:'\2002\00b7\2002 ACTIVE'}
+.mot-estop.on{background:var(--danger);border-color:var(--danger);box-shadow:0 4px 14px rgba(220,38,38,.42)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:20px 28px;margin-top:16px}
+.kv dt{margin-bottom:3px;font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--faint)}
+.kv dd{font-size:14.5px;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.clock{margin-top:8px;font-size:36px;line-height:1.15;font-weight:700;letter-spacing:-.5px;color:var(--ink);font-variant-numeric:tabular-nums}
+.clock-date{margin-top:4px;font-size:15px;color:var(--soft);font-variant-numeric:tabular-nums}
+/* ---- tables ---- */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse}
+thead th{padding:11px 20px;background:var(--tint);border-bottom:1px solid var(--line);font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;text-align:left;white-space:nowrap;color:var(--faint)}
+tbody td{padding:14px 20px;border-bottom:1px solid var(--line);font-size:14px;vertical-align:middle}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:#FAFCFF}
+th.col-actions,td.col-actions{text-align:right}
+.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+.actions form{display:contents}
+.cell-user{display:flex;align-items:center;gap:12px;min-width:0}
+.cell-user .avatar{width:38px;height:38px;font-size:14.5px}
+.cell-user>div{min-width:0}
+.cell-user b{display:block;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.cell-user small{display:block;font-size:12.5px;color:var(--faint);overflow-wrap:anywhere}
+.file-name{display:inline-flex;align-items:center;gap:10px;font-weight:600;color:var(--ink);text-decoration:none;overflow-wrap:anywhere}
+a.file-name:hover{color:var(--brand)}
+.file-name .ic{color:var(--brand)}
+.pin{display:inline-block;padding:5px 12px;border-radius:8px;background:var(--brand-50);color:var(--brand-dark);font-family:var(--mono);font-size:13.5px;font-weight:700}
+.mono{font-family:var(--mono);font-size:13px;overflow-wrap:anywhere}
+.sub{display:block;margin-top:3px;font-size:12.5px;color:var(--faint)}
+.nw{white-space:nowrap}
+td.empty{padding:38px 20px;text-align:center;color:var(--faint)}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;background:#F1F5F9;color:var(--soft);font-size:12.5px;font-weight:600;white-space:nowrap}
+.badge .ic{width:13px;height:13px}
+.badge-blue{background:var(--brand-50);color:var(--brand-dark)}
+.badge-violet{background:#F3E8FF;color:#6B21A8}
+.badge-warn{background:var(--warn-bg);color:var(--warn-ink)}
+.badge-ok{background:var(--ok-bg);color:var(--ok-ink)}
+/* ---- buttons ---- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:42px;padding:8px 18px;border:1px solid transparent;border-radius:10px;background:none;font-size:14px;font-weight:600;line-height:1.2;text-decoration:none;white-space:nowrap;transition:background .15s,border-color .15s,box-shadow .15s,color .15s}
+.btn .ic{width:17px;height:17px;vertical-align:0}
+.btn-sm{min-height:34px;padding:6px 12px;font-size:13px;border-radius:9px}
+.btn-sm .ic{width:15px;height:15px}
+.btn-block{width:100%}
+.btn-primary{background:var(--brand);color:#fff;box-shadow:0 1px 2px rgba(11,61,145,.32)}
+.btn-primary:hover{background:var(--brand-dark);box-shadow:0 4px 12px rgba(11,61,145,.3)}
+.btn-outline{background:#fff;color:var(--brand-dark);border-color:var(--line-2)}
+.btn-outline:hover{background:var(--brand-50);border-color:var(--brand)}
+.btn-cancel{background:#fff;color:var(--soft);border-color:var(--line-2)}
+.btn-cancel:hover{background:var(--tint);color:var(--text)}
+.btn-danger{background:var(--danger);color:#fff;box-shadow:0 1px 2px rgba(185,28,28,.32)}
+.btn-danger:hover{background:var(--danger-dark);box-shadow:0 4px 12px rgba(185,28,28,.3)}
+.btn-danger-outline{background:#fff;color:var(--danger-dark);border-color:var(--danger-line)}
+.btn-danger-outline:hover{background:var(--danger-bg);border-color:var(--danger)}
+.btn:disabled{opacity:.55;cursor:not-allowed;box-shadow:none}
+/* ---- forms ---- */
+.form-group{margin-bottom:18px}
+.form-group>label,.field-label{display:block;margin-bottom:6px;font-size:13px;font-weight:600;color:var(--text)}
+input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=hidden]),select,textarea{display:block;width:100%;min-height:42px;padding:9px 12px;border:1px solid var(--line-2);border-radius:10px;background:#fff;font-size:var(--fs-input);line-height:1.4;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(21,101,192,.16)}
+input::placeholder,textarea::placeholder{color:#94A3B8}
+input:disabled,input[readonly],select:disabled,textarea[readonly]{background:#F1F5F9;color:var(--faint)}
+select{-webkit-appearance:none;appearance:none;padding-right:38px;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748B' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;background-size:16px}
+input[type=file]{display:block;width:100%;padding:9px;border:1px dashed var(--line-2);border-radius:10px;background:var(--tint);font-size:14px;cursor:pointer}
+input[type=file]::file-selector-button{margin-right:12px;padding:8px 15px;border:0;border-radius:8px;background:var(--brand);color:#fff;font-weight:600;cursor:pointer}
+input[type=file]::-webkit-file-upload-button{margin-right:12px;padding:8px 15px;border:0;border-radius:8px;background:var(--brand);color:#fff;font-weight:600;cursor:pointer}
+input[type=checkbox],input[type=radio]{flex:none;width:18px;height:18px;margin-top:2px;accent-color:var(--brand)}
+.form-group>label.check{display:flex;align-items:flex-start;gap:10px;margin-bottom:0;font-size:14px;font-weight:400;cursor:pointer}
+.form-group>label .opt{font-weight:400;color:var(--faint)}
+.card>.section-h{margin-bottom:14px}
+#ota-status:not(:empty){margin-top:18px}
+textarea.code{min-height:320px;font-family:var(--mono);font-size:13px;line-height:1.55;white-space:pre;overflow:auto;resize:vertical}
+.form-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px}
+.form-hint{margin-top:6px;font-size:12.5px;color:var(--faint)}
+.form-section{margin-top:8px;padding-top:20px;border-top:1px solid var(--line)}
+.form-section h3{margin-bottom:14px;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.form-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px;padding-top:22px;border-top:1px solid var(--line)}
+.form-actions.bare{margin-top:0;padding-top:0;border-top:0}
+.inline-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px}
+.inline-form .form-group{flex:1 1 220px;min-width:0;margin-bottom:0}
+.pw{position:relative}
+.pw input{padding-right:46px!important}
+.pw-toggle{position:absolute;top:50%;right:5px;width:34px;height:34px;margin-top:-17px;display:grid;place-items:center;border:0;border-radius:8px;background:none;color:var(--faint)}
+.pw-toggle:hover{background:#F1F5F9;color:var(--text)}
+.pw-toggle .ic-eye-off,.pw-toggle.on .ic-eye{display:none}
+.pw-toggle.on .ic-eye-off{display:inline-block}
+.progress{height:6px;margin-top:16px;overflow:hidden;border-radius:999px;background:var(--brand-100)}
+.progress i{display:block;width:35%;height:100%;border-radius:999px;background:var(--brand);animation:slide 1.1s ease-in-out infinite}
+.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:18px}
+/* ---- alerts & state cards ---- */
+.alert{display:flex;align-items:flex-start;gap:11px;margin-bottom:18px;padding:13px 15px;border:1px solid transparent;border-radius:12px;font-size:14px;line-height:1.5}
+.alert .ic{margin-top:2px}
+.alert>div{min-width:0;overflow-wrap:anywhere}
+.alert-info{background:var(--brand-50);border-color:var(--brand-200);color:var(--brand-ink)}
+.alert-success{background:var(--ok-bg);border-color:var(--ok-line);color:var(--ok-ink)}
+.alert-warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+.alert-danger{background:var(--danger-bg);border-color:var(--danger-line);color:var(--danger-ink)}
+.state{max-width:520px;margin:5vh auto 0;padding:38px 30px;text-align:center}
+.state-icon{width:66px;height:66px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center}
+.state-icon .ic{width:30px;height:30px}
+.state-icon.danger{background:var(--danger-bg);color:var(--danger)}
+.state-icon.ok{background:var(--ok-bg);color:var(--ok)}
+.state-icon.info{background:var(--brand-50);color:var(--brand)}
+.state h2{margin-bottom:8px;font-size:20px;font-weight:700;color:var(--ink)}
+.state p{font-size:14.5px;color:var(--soft);overflow-wrap:anywhere}
+.state p b{color:var(--ink)}
+.state-note{margin-top:6px;font-size:13px!important;color:var(--faint)!important}
+.state-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:26px}
+.state-actions .progress{flex:1 1 100%;margin-top:0}
+.account-id{margin-bottom:22px;padding-bottom:20px;border-bottom:1px solid var(--line)}
+/* ---- sign-in ---- */
+.auth{min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:radial-gradient(900px 520px at 15% -10%,#1F5FBF 0%,transparent 62%),radial-gradient(800px 480px at 105% 110%,#0F4DA6 0%,transparent 58%),linear-gradient(160deg,#0B2447,#0F2E5C)}
+.auth-card{width:100%;max-width:420px;padding:38px 34px 30px;background:#fff;border-radius:20px;box-shadow:var(--shadow-lg)}
+.auth-brand{margin-bottom:26px;text-align:center}
+.auth-logo{display:block;width:84px;height:84px;margin:0 auto 14px;filter:drop-shadow(0 8px 16px rgba(15,46,92,.3))}
+.auth-brand h1{font-size:21px;letter-spacing:.6px;color:var(--ink)}
+.auth-brand p{margin-top:3px;font-size:13.5px;color:var(--faint)}
+.auth-foot{margin-top:22px;text-align:center;font-size:12.5px;color:var(--faint)}
+/* ---- focus ---- */
+.btn:focus-visible{outline:3px solid rgba(21,101,192,.4);outline-offset:2px}
+.nav-link:focus-visible{outline:3px solid rgba(21,101,192,.4);outline-offset:-2px}
+.user-btn:focus-visible,.menu-btn:focus-visible{outline:3px solid rgba(255,255,255,.55);outline-offset:2px}
+a:focus-visible,.pw-toggle:focus-visible{outline:3px solid rgba(21,101,192,.4);outline-offset:2px}
+/* ---- responsive ---- */
+@media(min-width:701px) and (max-width:1180px){
+.actions .btn .lbl{display:none}
+.actions .btn{padding:6px 10px}
+}
+@media(max-width:900px){
+.menu-btn{display:inline-flex}
+.sidebar{position:fixed;left:0;top:var(--topbar);bottom:0;z-index:60;height:auto;width:min(86vw,300px);flex:none;visibility:hidden;transform:translateX(-104%);transition:transform .25s ease,visibility 0s linear .25s}
+body.nav-open .sidebar{visibility:visible;transform:none;box-shadow:var(--shadow-lg);transition:transform .25s ease}
+.scrim{display:block;position:fixed;left:0;right:0;top:var(--topbar);bottom:0;z-index:55;background:rgba(15,23,42,.5);opacity:0;visibility:hidden;transition:opacity .2s ease,visibility 0s linear .2s}
+body.nav-open .scrim{opacity:1;visibility:visible;transition:opacity .2s ease}
+body.nav-open{overflow:hidden}
+.main-content{padding:24px 22px 48px}
+}
+@media(max-width:700px){
+.stack thead{display:none}
+.stack,.stack tbody,.stack tr,.stack td{display:block;width:100%}
+.stack tr{padding:14px 16px;border-bottom:1px solid var(--line)}
+.stack tbody tr:last-child{border-bottom:0}
+.stack tbody tr:hover{background:none}
+.stack td{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:7px 0;border:0;text-align:right}
+.stack td::before{content:attr(data-label);flex:0 0 36%;font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;text-align:left;color:var(--faint)}
+.stack td.cell-main{display:block;padding:0 0 8px;text-align:left}
+.stack td.cell-main::before,.stack td.empty::before{display:none}
+.stack td.col-actions{display:block;padding:10px 0 0}
+.stack td.col-actions::before{display:none}
+.stack .actions{justify-content:stretch}
+.stack .actions .btn,.stack .actions form{flex:1 1 auto}
+.stack .actions form .btn{width:100%}
+.stack .actions .btn .lbl{display:inline}
+.stack-form td{display:block;padding:6px 0;text-align:left}
+.stack-form td::before{display:block;margin-bottom:5px}
+.stack-pair tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 12px}
+.stack-pair td.cell-main{grid-column:1/-1}
+}
+@media(max-width:640px){
+:root{--topbar:56px;--fs-input:16px}
+.topbar{gap:8px;padding:0 14px}
+.brand-sub,.user-meta,.user-btn .ic-chev{display:none}
+.brand-logo{width:36px;height:36px}
+.user-btn{padding:0 5px}
+.main-content{padding:20px 14px 40px}
+.card{padding:18px 16px}
+.card-head{padding:14px 16px}
+.page-head{gap:12px;margin-bottom:20px}
+.page-icon{width:40px;height:40px;border-radius:11px}
+.page-icon .ic{width:20px;height:20px}
+.page-title h1{font-size:20px}
+.head-actions,.head-actions .btn{width:100%}
+.form-row{grid-template-columns:1fr}
+.form-actions .btn{flex:1 1 140px}
+.btn{min-height:44px}
+.btn-sm{min-height:40px}
+.kv{grid-template-columns:1fr 1fr;gap:16px}
+.clock{font-size:30px}
+.state{margin-top:2vh;padding:30px 18px}
+.auth-card{padding:30px 22px 24px}
+}
+@media(max-width:380px){.kv{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*,::before,::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+)CSS";
+
+#undef S_PATH
+#undef S_POLY
+#undef S_GON
+#undef S_LINE
+#undef S_CIRC
+#undef S_RECT
+#undef S_ELL
+#undef SVG_ICON
+#undef SVG_OPEN
+#undef SVG_CLOSE
+
+// Tags shared by every page's <head>: charset first (must be within the first
+// 1024 bytes), the logo as the tab icon (declared explicitly so browsers don't
+// probe /favicon.ico, which would cost the ESP32 a socket for a 404), and the
+// stylesheet.
+static const char HEAD_COMMON[] =
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+    "<meta name='theme-color' content='#0F2E5C'>"
+    "<link rel='icon' type='image/png' href='/logo.png?v=" LOGO_VER "'>"
+    "<link rel='stylesheet' href='/style.css?v=" CSS_VER "'>";
+
+// Menu / sidebar-drawer / password-toggle helpers present on every page. Pages
+// built by handleRoot() add their own tab-switching script on top of this.
+static const char SHELL_JS[] = R"JS(
+function toggleNav(f){var o=typeof f==='boolean'?f:!document.body.classList.contains('nav-open');
+document.body.classList.toggle('nav-open',o);
+var b=document.getElementById('menuBtn');if(b)b.setAttribute('aria-expanded',o?'true':'false');}
+function closeUserMenu(){var d=document.getElementById('userDrop'),b=document.getElementById('userBtn');
+if(d)d.classList.remove('open');if(b)b.setAttribute('aria-expanded','false');}
+function toggleMenu(e){e.stopPropagation();var d=document.getElementById('userDrop'),b=document.getElementById('userBtn');
+var o=!d.classList.contains('open');d.classList.toggle('open',o);b.setAttribute('aria-expanded',o?'true':'false');}
+function togglePw(b){var i=b.parentNode.querySelector('input');var s=i.type==='password';
+i.type=s?'text':'password';b.classList.toggle('on',s);b.setAttribute('aria-label',s?'Hide password':'Show password');}
+document.addEventListener('click',closeUserMenu);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeUserMenu();toggleNav(false);}});
+)JS";
+
+// ============================================================
+//  Shared UI building blocks
+// ============================================================
+static String htmlEsc(const String &s)
+{
+  String o;
+  o.reserve(s.length() + 8);
+  for (unsigned i = 0; i < s.length(); i++)
+  {
+    char c = s[i];
+    if (c == '&')
+      o += "&amp;";
+    else if (c == '<')
+      o += "&lt;";
+    else if (c == '>')
+      o += "&gt;";
+    else if (c == '"')
+      o += "&quot;";
+    else if (c == '\'')
+      o += "&#39;";
+    else
+      o += c;
+  }
+  return o;
+}
+
+// Full web access: Super Admin and Admin.
+static bool isManagerRole(const String &role)
+{
+  return role == "SuperAdmin" || role == "Admin";
+}
+
+static String roleLabel(const String &role)
+{
+  return role == "SuperAdmin" ? String("Super Admin") : role;
+}
+
+// First letter of a name for avatar circles (a whole UTF-8 sequence, upper-cased when ASCII).
+static String initialOf(const String &s)
+{
+  if (s.length() == 0)
+    return String("?");
+  unsigned char c = (unsigned char)s[0];
+  if (c < 0x80)
+    return String((char)toupper(c));
+  unsigned n = 1;
+  while (n < s.length() && ((unsigned char)s[n] & 0xC0) == 0x80)
+    n++;
+  return s.substring(0, n);
+}
+
+// Name shown in the top bar: the BLE user's name, or the web admin's login.
+static String currentDisplayName()
+{
+  String email = currentUserEmail();
+  if (email.length() == 0)
+    return String(webAdminUser);
+  for (int i = 0; i < userCount; i++)
+  {
+    if (String(users[i].email).equalsIgnoreCase(email))
+      return String(users[i].name);
+  }
+  return email;
+}
+
+static String topbarHtml()
+{
+  String rawName = currentDisplayName();
+  String email = currentUserEmail();
+  String role = currentRole();
+  String h;
+  h.reserve(1800);
+  h = "<header class='topbar'>";
+  h += "<button class='menu-btn' id='menuBtn' type='button' onclick='toggleNav()' aria-label='Menu' "
+       "aria-controls='sidebar' aria-expanded='false'><i class='ic ic-menu'></i></button>";
+  h += "<a class='brand' href='/'><img class='brand-logo' src='/logo.png?v=" LOGO_VER "' width='40' height='40' alt=''>"
+       "<span class='brand-text'><span class='brand-name'>INTELLICONTROL</span>"
+       "<span class='brand-sub'>PLC Control Panel</span></span></a>";
+  h += "<span class='grow'></span>";
+  h += "<div class='user-menu'>";
+  h += "<button class='user-btn' id='userBtn' type='button' onclick='toggleMenu(event)' aria-haspopup='true' aria-expanded='false'>";
+  h += "<span class='avatar'>" + htmlEsc(initialOf(rawName)) + "</span>";
+  h += "<span class='user-meta'><b>" + htmlEsc(rawName) + "</b><small>" + roleLabel(role) + "</small></span>";
+  h += "<i class='ic ic-chev'></i></button>";
+  h += "<div class='user-dropdown' id='userDrop'>";
+  h += "<div class='dd-head'><b>" + htmlEsc(rawName) + "</b>";
+  h += "<small>" + (email.length() > 0 ? htmlEsc(email) : String("Web administrator")) + "</small>";
+  h += "<span class='badge badge-violet'>" + roleLabel(role) + "</span></div>";
+  h += "<a href='/account'><i class='ic ic-key'></i>Account settings</a>";
+  h += "<a href='/logout' class='dd-danger'><i class='ic ic-logout'></i>Logout</a>";
+  h += "</div></div></header>";
+  h += "<div class='busy-line'></div>";
+  return h;
+}
+
+static String navItem(const char *tab, const char *icon, const char *label, const String &active)
+{
+  bool on = active == tab;
+  String h = "<a class='nav-link";
+  if (on)
+    h += " active";
+  h += "' id='nav-";
+  h += tab;
+  h += "' data-tab='";
+  h += tab;
+  h += "' href='/?tab=";
+  h += tab;
+  h += "'";
+  if (on)
+    h += " aria-current='page'";
+  h += "><i class='ic ic-";
+  h += icon;
+  h += "'></i><span>";
+  h += label;
+  h += "</span></a>";
+  return h;
+}
+
+// Sidebar (a slide-in drawer on small screens) trimmed to what `role` may open.
+// Items are plain links so they work on every page; handleRoot() upgrades them
+// to in-page tab switches.
+static String sidebarHtml(const String &role, const String &active)
+{
+  bool isAdmin = isManagerRole(role);
+  bool isOperator = (role == "Operator");
+  String h;
+  h.reserve(2400);
+  h = "<aside class='sidebar' id='sidebar'><nav aria-label='Main navigation'>";
+  h += "<div class='nav-title'>Overview</div>";
+  h += navItem("home", "home", "Home", active);
+  if (isAdmin)
+  {
+    h += "<div class='nav-title'>Management</div>";
+    h += navItem("users", "users", "User Management", active);
+    h += navItem("devices", "phone", "Device Registry", active);
+  }
+  if (isAdmin || isOperator)
+  {
+    h += "<div class='nav-title'>Configuration</div>";
+    h += navItem("outconfig", "sliders", "Output Config", active);
+    h += navItem("inconfig", "cpu", "Input Config", active);
+    h += navItem("network", "wifi", "Network Settings", active);
+    h += navItem("time", "clock", "Time &amp; Date", active);
+  }
+  if (isAdmin)
+  {
+    h += "<div class='nav-title'>System</div>";
+    h += navItem("ota", "cloud", "Firmware Update", active);
+    h += navItem("files", "folder", "Files", active);
+  }
+  h += "</nav><div class='side-foot'><b>IntelliControl</b>" FIRMWARE_VERSION "</div></aside>";
+  h += "<div class='scrim' onclick='toggleNav(false)'></div>";
+  return h;
+}
+
+// Page heading: icon chip, title, optional subtitle and right-aligned actions.
+static String panelHead(const char *icon, const char *title, const String &sub = String(), const String &actions = String())
+{
+  String h = "<div class='page-head'><span class='page-icon'><i class='ic ic-";
+  h += icon;
+  h += "'></i></span><div class='page-title'><h1>";
+  h += title;
+  h += "</h1>";
+  if (sub.length() > 0)
+  {
+    h += "<p>";
+    h += sub;
+    h += "</p>";
+  }
+  h += "</div>";
+  if (actions.length() > 0)
+  {
+    h += "<div class='head-actions'>";
+    h += actions;
+    h += "</div>";
+  }
+  h += "</div>";
+  return h;
+}
+
+// kind: "info" | "success" | "warn" | "danger"
+static const char *alertIcon(const char *kind)
+{
+  if (strcmp(kind, "success") == 0)
+    return "check-circle";
+  if (strcmp(kind, "warn") == 0)
+    return "alert";
+  if (strcmp(kind, "danger") == 0)
+    return "alert-circle";
+  return "info";
+}
+
+static String alertHtml(const char *kind, const String &msg)
+{
+  String h = "<div class='alert alert-";
+  h += kind;
+  h += "'><i class='ic ic-";
+  h += alertIcon(kind);
+  h += "'></i><div>";
+  h += msg;
+  h += "</div></div>";
+  return h;
+}
+
+static String backButton(const String &url, const char *label = "Back")
+{
+  return "<a href='" + url + "' class='btn btn-cancel'><i class='ic ic-left'></i>" + String(label) + "</a>";
+}
+
+// Centred message card for results, errors and confirmations.
+// kind: "ok" | "danger" | "info" (colours the icon disc).
+static String stateCard(const char *kind, const char *icon, const String &title, const String &body, const String &actions = String())
+{
+  String h = "<div class='card state'><div class='state-icon ";
+  h += kind;
+  h += "'><i class='ic ic-";
+  h += icon;
+  h += "'></i></div><h2>";
+  h += title;
+  h += "</h2><p>";
+  h += body;
+  h += "</p>";
+  if (actions.length() > 0)
+  {
+    h += "<div class='state-actions'>";
+    h += actions;
+    h += "</div>";
+  }
+  h += "</div>";
+  return h;
+}
+
+// Which sidebar entry a page belongs under, judged from the URL it links back to.
+static String navTabFor(const char *url)
+{
+  String u(url);
+  int t = u.indexOf("tab=");
+  if (t >= 0)
+  {
+    String tab = u.substring(t + 4);
+    int amp = tab.indexOf('&');
+    return amp >= 0 ? tab.substring(0, amp) : tab;
+  }
+  if (u.startsWith("/add") || u.startsWith("/edit"))
+    return String("users");
+  return String("");
+}
+
+// Tab switching for the full dashboard page (added on top of SHELL_JS). A sidebar
+// click fetches just that tab's markup (?frag=1) and swaps it into
+// .main-content instead of reloading the page — see the long note in handleRoot().
+static const char SHELL_TAB_JS[] = R"JS(
+var __pollTimer=null,__navSeq=0;
+function __stopTimers(){if(__pollTimer){clearInterval(__pollTimer);__pollTimer=null;}}
+function __runScripts(c){var l=c.querySelectorAll('script');
+for(var i=0;i<l.length;i++){var o=l[i],s=document.createElement('script');
+if(o.src){s.src=o.src;}else{s.textContent=o.textContent;}o.parentNode.replaceChild(s,o);}}
+function showTab(t,noPush){
+var mc=document.querySelector('.main-content');
+if(!mc){window.location='/?tab='+encodeURIComponent(t);return;}
+var seq=++__navSeq;
+document.body.classList.add('busy');mc.classList.add('loading');
+fetch('/?tab='+encodeURIComponent(t)+'&frag=1',{cache:'no-store',headers:{'X-Requested-With':'fetch'}})
+.then(function(r){if(!r.ok||(r.url&&r.url.indexOf('/login')!==-1))throw new Error('nav-failed');return r.text();})
+.then(function(frag){
+if(seq!==__navSeq)return;
+__stopTimers();mc.innerHTML=frag;__runScripts(mc);
+var items=document.querySelectorAll('.nav-link');
+for(var i=0;i<items.length;i++){items[i].classList.remove('active');items[i].removeAttribute('aria-current');}
+var n=document.getElementById('nav-'+t);
+if(n){n.classList.add('active');n.setAttribute('aria-current','page');document.title=n.textContent.trim()+' | IntelliControl';}
+if(!noPush)history.pushState({tab:t},'','/?tab='+encodeURIComponent(t));
+__currentTab=t;window.scrollTo(0,0);
+document.body.classList.remove('busy');mc.classList.remove('loading');})
+.catch(function(){if(seq===__navSeq)window.location='/?tab='+encodeURIComponent(t);});}
+document.addEventListener('click',function(e){
+var a=e.target.closest?e.target.closest('a.nav-link[data-tab]'):null;
+if(a&&e.button===0&&!e.metaKey&&!e.ctrlKey&&!e.shiftKey&&!e.altKey){
+e.preventDefault();toggleNav(false);showTab(a.getAttribute('data-tab'));}});
+window.addEventListener('popstate',function(){
+var t=new URLSearchParams(window.location.search).get('tab')||'home';
+if(t!==__currentTab)showTab(t,true);});
+)JS";
+
+// Home tab live updater. It travels with the panel's own markup so it works both
+// on a full page load and when the panel is swapped in as an AJAX fragment.
+static const char HOME_JS[] = R"JS(
+function updateHomeUI(s){
+var st=(s.ble_conn===1&&s.ble_auth===1)?'on':(s.ble_conn===1?'wait':'off');
+var bc=document.getElementById('hble-conn'),bt=document.getElementById('hble-txt');
+var bu=document.getElementById('hble-user'),bn=document.getElementById('hble-uname');
+if(bc)bc.className='pill pill-'+st;
+if(bt)bt.textContent=st==='on'?'Connected':(st==='wait'?'Authenticating...':'Not connected');
+if(bu){bu.hidden=st!=='on';if(bn)bn.textContent=s.ble_user||'Unknown';}
+var m={estop:s.estop,up:s.up,down:s.down,left:s.left,right:s.right};
+for(var k in m){var el=document.getElementById('m-'+k);if(el)el.classList.toggle('on',m[k]===1);}
+var sum=document.getElementById('hmot-sum');
+if(sum)sum.textContent=(s.up||s.down||s.left||s.right)?'Motion active':'No active motion';}
+if(typeof __stopTimers==='function')__stopTimers();
+__pollTimer=setInterval(function(){
+var __pc=new AbortController();
+var __pt=setTimeout(function(){__pc.abort();},2500);
+fetch('/motion/status',{cache:'no-store',signal:__pc.signal}).then(function(r){clearTimeout(__pt);return r.json();})
+.then(function(s){updateHomeUI(s);}).catch(function(){clearTimeout(__pt);});
+},3000);
+)JS";
+
+// Output Config save without a full page reload (the validation mirrors the
+// server's). The pin count is spliced in between OC_JS_A and OC_JS_B.
+static const char OC_JS_A[] = R"JS(
+(function(){
+var f=document.getElementById('oc-form');if(!f)return;
+var b=document.getElementById('oc-save-btn');
+var m=document.getElementById('oc-save-msg');
+function setMsg(ok,msg){if(!m)return;m.hidden=false;m.className='alert '+(ok?'alert-success':'alert-danger');
+m.innerHTML="<i class='ic ic-"+(ok?'check-circle':'alert-circle')+"'></i><div></div>";m.lastChild.textContent=msg;}
+f.addEventListener('submit',function(e){e.preventDefault();
+var functions=[],motions=[];
+for(var p=0;p<)JS";
+static const char OC_JS_B[] = R"JS(;p++){
+var fsel=f.elements['pin_'+p+'_function'];if(fsel){functions.push(fsel.value);}
+var msel=f.elements['pin_'+p+'_motion'];if(msel){motions.push(msel.value);}
+}
+var noneVal='0';
+var funcSeen={};
+for(var i=0;i<functions.length;i++){
+if(funcSeen[functions[i]]){setMsg(false,'Save failed: each output must have a unique digital function.');return;}
+funcSeen[functions[i]]=true;}
+var motSeen={};
+for(var i=0;i<motions.length;i++){
+if(motions[i]!==noneVal){
+if(motSeen[motions[i]]){setMsg(false,'Save failed: two outputs cannot be assigned the same motion.');return;}
+motSeen[motions[i]]=true;}
+}
+if(b)b.disabled=true;
+var body=new URLSearchParams(new FormData(f)).toString();
+fetch('/outconfig',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'},body:body})
+.then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})
+.then(function(x){
+if(!x.ok||!x.body||!x.body.ok)throw new Error((x.body&&x.body.msg)?x.body.msg:'Save failed. Please try again.');
+setMsg(true,'Configuration saved successfully.');
+})
+.catch(function(err){setMsg(false,(err&&err.message)?err.message:'Save failed. Please try again.');})
+.finally(function(){if(b)b.disabled=false;});
+});
+})();
+)JS";
+
+// ---- table / dashboard fragments ----
+
+// "Perpetual" badge, or a "Timed" badge with its date range underneath.
+static String accessCell(const User &u)
+{
+  if (u.accessType != ACCESS_TIMED)
+    return String("<span class='badge'>Perpetual</span>");
+  return "<div><span class='badge badge-warn'><i class='ic ic-clock'></i>Timed</span><span class='sub'>"
+         "<span class='nw'>" +
+         formatDateTime(u.startTs) + "</span> to <span class='nw'>" + formatDateTime(u.endTs) +
+         "</span></span></div>";
+}
+
+static String roleBadge(const char *role)
+{
+  bool admin = strcmp(role, "Admin") == 0;
+  return String("<span class='badge ") + (admin ? "badge-violet" : "badge-blue") + "'>" + htmlEsc(String(role)) + "</span>";
+}
+
+// One live indicator in the Home tab's motion panel.
+static String motionChip(const char *id, const char *icon, const char *label, bool on)
+{
+  String h = "<div id='m-";
+  h += id;
+  h += "' class='mot mot-";
+  h += id;
+  if (on)
+    h += " on";
+  h += "'><i class='ic ic-";
+  h += icon;
+  h += "'></i><span>";
+  h += label;
+  h += "</span></div>";
+  return h;
+}
+
+static String kvItem(const char *label, const String &valueHtml)
+{
+  return "<div><dt>" + String(label) + "</dt><dd>" + valueHtml + "</dd></div>";
+}
+
+// Icon + label button for table action columns (the label hides on mid-width
+// screens, so the tooltip / aria-label carries the meaning there).
+static String actionLink(const String &href, const char *cls, const char *icon, const char *label, const char *tip)
+{
+  return "<a href='" + href + "' class='btn btn-sm " + cls + "' title='" + tip + "' aria-label='" + tip +
+         "'><i class='ic ic-" + icon + "'></i><span class='lbl'>" + label + "</span></a>";
+}
+
+// Access Type dropdown + From/To date-time inputs (shown only for Timed).
+// `u` is null on the Add form (defaults to Perpetual).
+static String accessFormFields(const User *u)
+{
+  bool timed = u && u->accessType == ACCESS_TIMED;
+  String h = "<div class='form-section'><h3>Access</h3>";
+  h += "<div class='form-group'><label for='accessType'>Access type</label>";
+  h += "<select name='accessType' id='accessType' "
+       "onchange=\"var t=this.value==='timed';document.getElementById('timedBox').hidden=!t;"
+       "document.getElementById('fromTime').required=document.getElementById('toTime').required=t;\">";
+  h += "<option value='perpetual'" + String(timed ? "" : " selected") + ">Perpetual (any time)</option>";
+  h += "<option value='timed'" + String(timed ? " selected" : "") + ">Timed (only between a start and end date/time)</option>";
+  h += "</select><div class='form-hint'>Timed users can sign in only between the start and end below.</div></div>";
+  h += "<div class='form-row' id='timedBox'" + String(timed ? "" : " hidden") + ">";
+  h += "<div class='form-group'><label for='fromTime'>From (date &amp; time)</label>"
+       "<input type='datetime-local' name='fromTime' id='fromTime' value='" +
+       (timed ? formatDateTime(u->startTs, true) : String("")) + "'" + (timed ? " required" : "") + "></div>";
+  h += "<div class='form-group'><label for='toTime'>To (date &amp; time)</label>"
+       "<input type='datetime-local' name='toTime' id='toTime' value='" +
+       (timed ? formatDateTime(u->endTs, true) : String("")) + "'" + (timed ? " required" : "") + "></div>";
+  h += "</div></div>";
+  return h;
+}
+
+// Password input with a show/hide eye button.
+static String passwordField(const char *id, const char *name, const char *placeholder, const String &value = String(),
+                            const char *extraAttrs = "")
+{
+  String h = "<div class='pw'><input id='";
+  h += id;
+  h += "' type='password' name='";
+  h += name;
+  h += "' placeholder='";
+  h += placeholder;
+  h += "'";
+  if (value.length() > 0)
+    h += " value='" + value + "'";
+  h += " ";
+  h += extraAttrs;
+  h += "><button type='button' class='pw-toggle' onclick='togglePw(this)' aria-label='Show password'>"
+       "<i class='ic ic-eye'></i><i class='ic ic-eye-off'></i></button></div>";
+  return h;
+}
+
+// Focused confirmation card for deleting something (user or file).
+static String confirmDeleteCard(const char *action, const char *hiddenName, const String &hiddenValueEsc,
+                                const String &itemEsc, const String &cancelUrl, const char *noun)
+{
+  String h = "<form method='POST' action='";
+  h += action;
+  h += "' class='card state'><input type='hidden' name='";
+  h += hiddenName;
+  h += "' value='" + hiddenValueEsc + "'>";
+  h += "<div class='state-icon danger'><i class='ic ic-trash'></i></div>";
+  h += "<h2>Delete this ";
+  h += noun;
+  h += "?</h2><p>You are about to delete<br><b>" + itemEsc + "</b></p>";
+  h += "<p class='state-note'>This action cannot be undone.</p>";
+  h += "<div class='state-actions'><button type='submit' class='btn btn-danger'><i class='ic ic-trash'></i>Yes, delete</button>";
+  h += backButton(cancelUrl, "Cancel") + "</div></form>";
+  return h;
+}
 
 // ============================================================
 //  Login page
@@ -494,126 +1173,72 @@ static const char HTML_STYLE[] =
 static String loginPage(const String &errMsg)
 {
   String html;
+  html.reserve(3200);
   html = "<!DOCTYPE html><html lang='en'><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Sign In | INTELLI RRC</title>";
-  html += "<link rel='stylesheet' href='/style.css?v=3'>";
-  html += "<style>"
-          "body{display:flex;justify-content:center;align-items:center;min-height:100vh;"
-          "background:radial-gradient(circle at 30% 20%,#123B7A,#0B2447 70%);}"
-          ".login-box{background:#fff;border:1px solid var(--border);border-radius:14px;"
-          "box-shadow:0 20px 50px rgba(0,0,0,.3);padding:40px 36px;width:100%;max-width:380px;}"
-          ".login-brand{text-align:center;color:var(--text);font-size:20px;font-weight:700;"
-          "letter-spacing:.3px;margin-bottom:4px;}"
-          ".login-sub{text-align:center;color:var(--text-soft);font-size:13px;margin-bottom:28px;}"
-          "@media(max-width:440px){"
-          ".login-box{padding:30px 20px;border-radius:10px;}"
-          ".login-brand{font-size:17px;}"
-          "}"
-          "</style>";
-  html += "</head><body>";
-  html += "<div class='login-box'>";
-  html += "<div class='login-brand'>&#9889; INTELLI RRC</div>";
-  html += "<div class='login-sub'>PLC Control Panel</div>";
+  html += HEAD_COMMON;
+  html += "<title>Sign In | INTELLIControl</title></head><body>";
+  html += "<main class='auth'><div class='auth-card'>";
+  html += "<div class='auth-brand'><img class='auth-logo' src='/logo.png?v=" LOGO_VER "' width='84' height='84' alt=''>";
+  html += "<h1>INTELLICONTROL</h1><p>PLC Control Panel</p></div>";
   if (errMsg.length() > 0)
-  {
-    html += "<div class='alert alert-danger'>" + errMsg + "</div>";
-  }
+    html += alertHtml("danger", errMsg);
   html += "<form method='POST' action='/login'>";
-  html += "<div class='form-group'><label>Email Address</label>";
-  html += "<input type='email' name='username' placeholder='Enter your email address' required autofocus></div>";
-  html += "<div class='form-group' style='margin-bottom:24px;'><label>Password</label>";
-  html += "<input type='password' name='password' placeholder='Enter password' required></div>";
-  html += "<button type='submit' class='btn btn-primary' "
-          "style='width:100%;justify-content:center;padding:11px;font-size:15px;'>"
-          "&#128274; Sign In</button>";
-  html += "</form></div></body></html>";
+  html += "<div class='form-group'><label for='login-user'>Email address</label>";
+  html += "<input id='login-user' type='email' name='username' placeholder='Enter your email address' "
+          "autocomplete='username' required autofocus></div>";
+  html += "<div class='form-group'><label for='login-pass'>Password</label>";
+  html += passwordField("login-pass", "password", "Enter password", String(), "autocomplete='current-password' required");
+  html += "</div>";
+  html += "<button type='submit' class='btn btn-primary btn-block'><i class='ic ic-login'></i>Sign in</button>";
+  html += "</form>";
+  html += "<p class='auth-foot'>Authorised personnel only</p>";
+  html += "</div></main><script>";
+  html += SHELL_JS;
+  html += "</script></body></html>";
   return html;
 }
 
 // ============================================================
 //  Page helpers
 // ============================================================
-static String pageHead(const char *title, const char *subtitle = nullptr)
+// Opens a standalone page (add / edit / confirm / account ...) in the same app
+// shell as the dashboard: top bar, sidebar, then `.page`. `navTab` is the
+// sidebar entry to highlight; the page heading is drawn only when `icon` is set.
+// Close it with pageFoot().
+static String pageHead(const char *title, const char *subtitle = nullptr, const char *navTab = nullptr,
+                       const char *icon = nullptr, bool narrow = true)
 {
   String h;
+  h.reserve(5200);
   h = "<!DOCTYPE html><html lang='en'><head>";
-  h += "<meta charset='UTF-8'>";
-  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += HEAD_COMMON;
   h += "<title>";
   h += title;
-  h += " | Intelli RRC</title>";
-  h += "<link rel='stylesheet' href='/style.css?v=3'>";
-  h += "</head><body>";
-  h += "<div class='topbar'>";
-  h += "<span class='brand'>INTELLI RRC</span>";
-  h += "<div class='user-menu'>";
-  h += "<button class='user-btn' onclick='toggleMenu(event)'>";
-  {
-    String _dn;
-    String _sue = currentUserEmail();
-    if (_sue.length() > 0)
-    {
-      // Show name for BLE users
-      _dn = _sue; // fallback to email
-      for (int _i = 0; _i < userCount; _i++)
-      {
-        if (String(users[_i].email).equalsIgnoreCase(_sue))
-        {
-          _dn = String(users[_i].name);
-          break;
-        }
-      }
-    }
-    else
-    {
-      _dn = String(webAdminUser);
-    }
-    h += "<div class='user-avatar'>" + String((char)toupper(_dn[0])) + "</div>";
-    h += "<span class='uname'>" + _dn + "</span>";
-  }
-  h += "<span class='arr' style='font-size:10px;opacity:.75;'>&#9660;</span>";
-  h += "</button>";
-  h += "<div class='user-dropdown' id='userDrop'>";
-  h += "<a href='/account'>&#9881; Account Settings</a>";
-  h += "<a href='/logout' class='dd-danger'>&#x23FB; Logout</a>";
-  h += "</div></div>";
-  h += "</div><div class='container'>";
-  h += "<div class='page-title'><h1>";
-  h += title;
-  h += "</h1>";
-  if (subtitle)
-  {
-    h += "<p class='subtitle'>";
-    h += subtitle;
-    h += "</p>";
-  }
-  h += "</div>";
+  h += " | IntelliControl</title></head><body>";
+  h += topbarHtml();
+  h += "<div class='layout'>";
+  h += sidebarHtml(currentRole(), navTab ? String(navTab) : String());
+  h += "<main class='main-content'><div class='page";
+  if (narrow)
+    h += " page-narrow";
+  h += "'>";
+  if (icon)
+    h += panelHead(icon, title, subtitle ? String(subtitle) : String());
   return h;
 }
 
 static String pageFoot()
 {
-  return "<script>"
-         "function toggleMenu(e){e.stopPropagation();"
-         "document.getElementById('userDrop').classList.toggle('open');}"
-         "document.addEventListener('click',function(){"
-         "var d=document.getElementById('userDrop');if(d)d.classList.remove('open');});"
-         "</script>"
-         "</div></body></html>";
+  String h = "</div></main></div><script>";
+  h += SHELL_JS;
+  h += "</script></body></html>";
+  return h;
 }
 
 static String errorPage(String msg, const char *backUrl)
 {
-  String h = pageHead("Error");
-  h += "<div class='card'><div class='alert alert-danger'>";
-  h += msg;
-  h += "</div>";
-  h += "<a href='";
-  h += backUrl;
-  h += "' class='btn btn-cancel'>&#8592; Back</a>";
-  h += "</div>";
+  String h = pageHead("Error", nullptr, navTabFor(backUrl).c_str());
+  h += stateCard("danger", "alert-circle", "Something went wrong", msg, backButton(String(backUrl)));
   h += pageFoot();
   return h;
 }
@@ -662,12 +1287,6 @@ static bool webAuthOutputConfig()
     return false;
   }
   return true;
-}
-
-// Full web access: Super Admin and Admin.
-static bool isManagerRole(const String &role)
-{
-  return role == "SuperAdmin" || role == "Admin";
 }
 
 static bool webAuthAdmin()
@@ -779,29 +1398,6 @@ static void handleLogout()
 // Lines are only counted for files up to this size, so listing the card
 // can't stall the main loop (which also runs the safety I/O) on huge files.
 #define FILE_COUNT_MAX_BYTES 262144UL
-
-static String htmlEsc(const String &s)
-{
-  String o;
-  o.reserve(s.length() + 8);
-  for (unsigned i = 0; i < s.length(); i++)
-  {
-    char c = s[i];
-    if (c == '&')
-      o += "&amp;";
-    else if (c == '<')
-      o += "&lt;";
-    else if (c == '>')
-      o += "&gt;";
-    else if (c == '"')
-      o += "&quot;";
-    else if (c == '\'')
-      o += "&#39;";
-    else
-      o += c;
-  }
-  return o;
-}
 
 static String urlEnc(const String &s)
 {
@@ -991,10 +1587,15 @@ static void handleRoot()
   bool clientDead = false;
   auto flush = [&]()
   {
-    if (clientDead) { html = ""; return; }
+    if (clientDead)
+    {
+      html = "";
+      return;
+    }
     if (html.length() > 0)
     {
-      if (!webServer.client().connected()) {
+      if (!webServer.client().connected())
+      {
         clientDead = true;
         html = "";
         return;
@@ -1002,7 +1603,8 @@ static void handleRoot()
       unsigned long writeStartMs = millis();
       webServer.sendContent(html);
       unsigned long writeMs = millis() - writeStartMs;
-      if (writeMs > 300) {
+      if (writeMs > 300)
+      {
         Serial.printf("Web: client write took %lums — treating connection as dead, closing it\n", writeMs);
         webServer.client().stop();
         clientDead = true;
@@ -1017,132 +1619,45 @@ static void handleRoot()
   };
   if (!fragMode)
   {
-  html = "<!DOCTYPE html><html lang='en'><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Intelli RRC</title>";
-  html += "<link rel='stylesheet' href='/style.css?v=3'>";
-  html += "</head><body>";
+    html = "<!DOCTYPE html><html lang='en'><head>";
+    html += HEAD_COMMON;
+    html += "<title>IntelliControl</title></head><body>";
 
-  // Page-shell script: tab switching, menu toggle, and the helpers a
-  // tab's own inline <script> (moved into that tab's panel markup below)
-  // relies on. Emitted once, before any panel content, so those helpers
-  // exist by the time a panel's script runs — whether that's this same
-  // full-page load, or a later fragment swapped in by showTab().
-  html += "<script>";
-  html += "var __currentTab='" + activeTab + "';";
-  html += "var __pollTimer=null;";
-  html += "function __stopTimers(){if(__pollTimer){clearInterval(__pollTimer);__pollTimer=null;}}";
-  html += "function __runScripts(container){";
-  html += "var list=container.querySelectorAll('script');";
-  html += "for(var i=0;i<list.length;i++){";
-  html += "var old=list[i];var s=document.createElement('script');";
-  html += "if(old.src){s.src=old.src;}else{s.textContent=old.textContent;}";
-  html += "old.parentNode.replaceChild(s,old);}}";
-  html += "function showTab(t){";
-  html += "var mc=document.querySelector('.main-content');";
-  html += "if(!mc){window.location='/?tab='+encodeURIComponent(t);return;}";
-  html += "fetch('/?tab='+encodeURIComponent(t)+'&frag=1',{cache:'no-store',headers:{'X-Requested-With':'fetch'}})";
-  html += ".then(function(r){if(!r.ok||(r.url&&r.url.indexOf('/login')!==-1))throw new Error('nav-failed');return r.text();})";
-  html += ".then(function(frag){";
-  html += "__stopTimers();mc.innerHTML=frag;__runScripts(mc);";
-  html += "var items=document.querySelectorAll('.sidebar-item');";
-  html += "for(var i=0;i<items.length;i++)items[i].classList.remove('active');";
-  html += "var navEl=document.getElementById('nav-'+t);if(navEl)navEl.classList.add('active');";
-  html += "history.pushState({tab:t},'','/?tab='+encodeURIComponent(t));";
-  html += "__currentTab=t;";
-  html += "})";
-  html += ".catch(function(){window.location='/?tab='+encodeURIComponent(t);});";
-  html += "}";
-  html += "window.addEventListener('popstate',function(){";
-  html += "var params=new URLSearchParams(window.location.search);";
-  html += "var t=params.get('tab')||'home';";
-  html += "if(t!==__currentTab)showTab(t);});";
-  html += "function toggleMenu(e){e.stopPropagation();"
-          "document.getElementById('userDrop').classList.toggle('open');}"
-          "document.addEventListener('click',function(){"
-          "var d=document.getElementById('userDrop');if(d)d.classList.remove('open');});";
-  html += "</script>";
-  mayFlush(); // flush <head>+styles+shell script immediately
+    // Page-shell script: menu / drawer helpers, tab switching, and the helpers
+    // a tab's own inline <script> (moved into that tab's panel markup below)
+    // relies on. Emitted once, before any panel content, so those helpers
+    // exist by the time a panel's script runs — whether that's this same
+    // full-page load, or a later fragment swapped in by showTab().
+    html += "<script>";
+    html += SHELL_JS;
+    html += "var __currentTab='" + activeTab + "';";
+    html += SHELL_TAB_JS;
+    html += "</script>";
+    mayFlush(); // flush <head>+shell script immediately
 
-  // Topbar
-  html += "<div class='topbar'>";
-  html += "<span class='brand'>INTELLI RRC</span>";
-  html += "<div class='user-menu'>";
-  html += "<button class='user-btn' onclick='toggleMenu(event)'>";
-  {
-    String _dn;
-    String _sue2 = currentUserEmail();
-    if (_sue2.length() > 0)
-    {
-      _dn = _sue2; // fallback
-      for (int _i = 0; _i < userCount; _i++)
-      {
-        if (String(users[_i].email).equalsIgnoreCase(_sue2))
-        {
-          _dn = String(users[_i].name);
-          break;
-        }
-      }
-    }
-    else
-    {
-      _dn = String(webAdminUser);
-    }
-    html += "<div class='user-avatar'>" + String((char)toupper(_dn[0])) + "</div>";
-    html += "<span class='uname'>" + _dn + "</span>";
-  }
-  html += "<span class='arr' style='font-size:10px;opacity:.75;'>&#9660;</span>";
-  html += "</button>";
-  html += "<div class='user-dropdown' id='userDrop'>";
-  html += "<a href='/account'>&#9881; Account Settings</a>";
-  html += "<a href='/logout' class='dd-danger'>&#x23FB; Logout</a>";
-  html += "</div></div>";
-  html += "</div>";
+    html += topbarHtml();
+    mayFlush(); // flush top bar before building the sidebar, keeping the buffer small
+    html += "<div class='layout'>";
+    html += sidebarHtml(role, activeTab);
+    mayFlush(); // flush sidebar
 
-  // Two-column layout
-  html += "<div class='layout'>";
-
-  // --- Sidebar ---
-  html += "<div class='sidebar'>";
-  html += "<div class='sidebar-section'>Navigation</div>";
-  html += "<div class='sidebar-item" + String(isHome ? " active" : "") + "' id='nav-home' onclick=\"showTab('home')\"\u003e<span class='sidebar-icon'>&#127968;</span>Home</div>";
-  if (isAdmin)
-  {
-    html += "<div class='sidebar-item" + String(isUsers ? " active" : "") + "' id='nav-users' onclick=\"showTab('users')\"\u003e<span class='sidebar-icon'>&#128100;</span>User Management</div>";
-    html += "<div class='sidebar-item" + String(isDevices ? " active" : "") + "' id='nav-devices' onclick=\"showTab('devices')\"\u003e<span class='sidebar-icon'>&#128241;</span>Device Registry</div>";
-    html += "<div class='sidebar-item" + String(isOta ? " active" : "") + "' id='nav-ota' onclick=\"showTab('ota')\"\u003e<span class='sidebar-icon'>&#128260;</span>Firmware Update</div>";
-    html += "<div class='sidebar-item" + String(isFiles ? " active" : "") + "' id='nav-files' onclick=\"showTab('files')\"><span class='sidebar-icon'>&#128193;</span>Files</div>";
-  }
-  if (isAdmin || isOperator)
-  {
-    html += "<div class='sidebar-item" + String(isOutConfig ? " active" : "") + "' id='nav-outconfig' onclick=\"showTab('outconfig')\"\u003e<span class='sidebar-icon'>&#9881;</span>Output Config</div>";
-    html += "<div class='sidebar-item" + String(isInConfig ? " active" : "") + "' id='nav-inconfig' onclick=\"showTab('inconfig')\"\u003e<span class='sidebar-icon'>&#128225;</span>Input Config</div>";
-    html += "<div class='sidebar-item" + String(isNetwork ? " active" : "") + "' id='nav-network' onclick=\"showTab('network')\"\u003e<span class='sidebar-icon'>&#128246;</span>Network Settings</div>";
-    html += "<div class='sidebar-item" + String(isTime ? " active" : "") + "' id='nav-time' onclick=\"showTab('time')\">" + "<span class='sidebar-icon'>&#128337;</span>Time &amp; Date</div>";
-  }
-  html += "</div>";
-  mayFlush(); // flush sidebar
-
-  // --- Main content ---
-  html += "<div class='main-content'>";
+    html += "<main class='main-content'>";
   } // end if (!fragMode) — shell (head/topbar/sidebar/main-content-open)
 
   // ====== HOME PANEL ======
   if (isHome)
   {
-    html += "<div id='tab-home' class='tab-panel active'>";
-    html += "<div class='section-title'>&#127968; Home</div>";
-    html += "<div class='home-grid'>";
+    html += "<div id='tab-home' class='page'>";
+    html += panelHead("home", "Home", "Live status of the PLC and its mobile connection");
+    html += "<div class='grid'>";
 
     // --- BLE Connection Card ---
     {
-      const char *pillCls, *dotCls, *bleLabel;
+      const char *state, *bleLabel;
       String userLabel = "";
       if (deviceConnected && authenticated)
       {
-        pillCls = "ble-pill ble-pill-on";
-        dotCls = "ble-dot ble-dot-on";
+        state = "on";
         bleLabel = "Connected";
         if (connectedUserEmail[0] != '\0')
         {
@@ -1159,89 +1674,63 @@ static void handleRoot()
       }
       else if (deviceConnected)
       {
-        pillCls = "ble-pill ble-pill-wait";
-        dotCls = "ble-dot ble-dot-wait";
+        state = "wait";
         bleLabel = "Authenticating...";
       }
       else
       {
-        pillCls = "ble-pill ble-pill-off";
-        dotCls = "ble-dot ble-dot-off";
-        bleLabel = "Not Connected";
+        state = "off";
+        bleLabel = "Not connected";
       }
-      html += "<div class='home-card' style='border-top:3px solid #16A34A;'>";
-      html += "<div class='home-card-title'>&#128241; BLE Connection</div>";
-      html += "<div id='hble-conn' class='" + String(pillCls) + "'>";
-      html += "<span class='" + String(dotCls) + "'></span>" + String(bleLabel) + "</div>";
-      if (userLabel.length() > 0)
-      {
-        html += "<div id='hble-user' style='margin-top:10px;font-size:15px;"
-                "color:#1E293B;font-weight:600;'>User: " +
-                userLabel + "</div>";
-      }
-      else
-      {
-        html += "<div id='hble-user' style='display:none;margin-top:10px;font-size:15px;"
-                "color:#1E293B;font-weight:600;'></div>";
-      }
+      html += "<div class='card stat'>";
+      html += "<div class='stat-head'><span class='stat-icon'><i class='ic ic-bluetooth'></i></span>"
+              "<div><div class='stat-title'>Mobile connection</div><div class='stat-sub'>Bluetooth (BLE)</div></div></div>";
+      html += "<div><span id='hble-conn' class='pill pill-" + String(state) + "'><span class='dot'></span>"
+                                                                              "<span id='hble-txt'>" +
+              String(bleLabel) + "</span></span></div>";
+      html += "<div id='hble-user' class='meta'" + String(userLabel.length() > 0 ? "" : " hidden") + ">"
+                                                                                                     "<span class='meta-k'>Signed in as</span><span class='meta-v' id='hble-uname'>" +
+              htmlEsc(userLabel) +
+              "</span></div>";
+      html += "<div class='meta'><span class='meta-k'>Advertised as</span><span class='meta-v'>" + htmlEsc(String(bleName)) +
+              "</span></div>";
       html += "</div>";
     }
 
     // --- Motion Status Card ---
     {
-      String tags = "";
-      // Web status reflects E-STOP output state: HIGH means shown as active.
-      if (!motionEstop)
-        tags += "<span class='motion-tag tag-estop'>&#9888; E-STOP</span>";
-      if (motionUp)
-        tags += "<span class='motion-tag tag-up'>&#9650; UP</span>";
-      if (motionDown)
-        tags += "<span class='motion-tag tag-down'>&#9660; DOWN</span>";
-      if (motionLeft)
-        tags += "<span class='motion-tag tag-up'>&#9664; LEFT</span>";
-      if (motionRight)
-        tags += "<span class='motion-tag tag-down'>&#9654; RIGHT</span>";
-      if (!motionUp && !motionDown && !motionLeft && !motionRight)
-        tags += "<span class='motion-tag tag-idle'>No Active Motion</span>";
-      html += "<div class='home-card' style='border-top:3px solid #EA580C;'>";
-      html += "<div class='home-card-title'>&#127959; Motion Status</div>";
-      html += "<div id='hmot-status'>" + tags + "</div>";
-      html += "</div>";
+      bool anyMotion = motionUp || motionDown || motionLeft || motionRight;
+      html += "<div class='card stat'>";
+      html += "<div class='stat-head'><span class='stat-icon warn'><i class='ic ic-activity'></i></span>"
+              "<div><div class='stat-title'>Motion status</div><div class='stat-sub' id='hmot-sum'>" +
+              String(anyMotion ? "Motion active" : "No active motion") + "</div></div></div>";
+      html += "<div class='motion-grid' id='hmot-status'>";
+      // Web status reflects E-STOP output state: LOW (motionEstop false) is shown as active.
+      html += motionChip("estop", "octagon", "E-STOP", !motionEstop);
+      html += motionChip("up", "up", "UP", motionUp);
+      html += motionChip("down", "down", "DOWN", motionDown);
+      html += motionChip("left", "left", "LEFT", motionLeft);
+      html += motionChip("right", "right", "RIGHT", motionRight);
+      html += "</div></div>";
     }
-    html += "</div>"; // end home-grid
+    html += "</div>"; // end grid
 
-    // Home tab live updater — travels with this panel's own markup (moved
-    // here from the old shared bottom script) so it works both on a full
-    // page load and when this panel is swapped in as an AJAX fragment.
-    html += "<script>";
-    html += "function updateHomeUI(s){";
-    html += "var bc=document.getElementById('hble-conn');";
-    html += "var bu=document.getElementById('hble-user');";
-    html += "if(bc){";
-    html += "if(s.ble_conn===1&&s.ble_auth===1){";
-    html += "bc.className='ble-pill ble-pill-on';";
-    html += "bc.innerHTML=\"<span class='ble-dot ble-dot-on'></span>Connected\";";
-    html += "if(bu){bu.style.display='block';bu.textContent='User: '+(s.ble_user||'Unknown');}";
-    html += "}else if(s.ble_conn===1){";
-    html += "bc.className='ble-pill ble-pill-wait';";
-    html += "bc.innerHTML=\"<span class='ble-dot ble-dot-wait'></span>Authenticating...\";";
-    html += "if(bu)bu.style.display='none';";
-    html += "}else{";
-    html += "bc.className='ble-pill ble-pill-off';";
-    html += "bc.innerHTML=\"<span class='ble-dot ble-dot-off'></span>Not Connected\";";
-    html += "if(bu)bu.style.display='none';}}";
-    html += "var ms=document.getElementById('hmot-status');";
-    html += "if(ms){";
-    html += "var mt='';";
-    html += "if(s.estop===1){mt+=\"<span class='motion-tag tag-estop'>&#9888; E-STOP</span>\";}";
-    html += "if(s.up===1)mt+=\"<span class='motion-tag tag-up'>&#9650; UP</span>\";";
-    html += "if(s.down===1)mt+=\"<span class='motion-tag tag-down'>&#9660; DOWN</span>\";";
-    html += "if(s.left===1)mt+=\"<span class='motion-tag tag-up'>&#9664; LEFT</span>\";";
-    html += "if(s.right===1)mt+=\"<span class='motion-tag tag-down'>&#9654; RIGHT</span>\";";
-    html += "if(!s.up&&!s.down&&!s.left&&!s.right)mt+=\"<span class='motion-tag tag-idle'>No Active Motion</span>\";";
-    html += "ms.innerHTML=mt;}}";
-    html += "if(typeof __stopTimers==='function')__stopTimers();";
-    html += "__pollTimer=setInterval(function(){";
+    // --- System card ---
+    html += "<div class='card'><h2 class='section-h'>System</h2><dl class='kv'>";
+    html += kvItem("Firmware", FIRMWARE_VERSION);
+    html += kvItem("Bluetooth name", htmlEsc(String(bleName)));
+    html += kvItem("Wi-Fi network", htmlEsc(String(wifiSsid)));
+    html += kvItem("Real-time clock", rtcOk ? "<span class='badge badge-ok'>Running</span>"
+                                            : "<span class='badge badge-warn'>Not detected</span>");
+    html += kvItem("SD card", sdOk ? "<span class='badge badge-ok'>Ready</span>"
+                                   : "<span class='badge badge-warn'>Not available</span>");
+    if (isAdmin)
+    {
+      html += kvItem("Registered users", String(userCount) + " / " + String(MAX_USERS));
+      html += kvItem("Registered devices", String(deviceCount) + " / " + String(MAX_DEVICES));
+    }
+    html += "</dl></div>";
+
     // A poll whose connection quietly dies mid-flight (WiFi hiccup, weak
     // signal) but is never aborted by the browser leaves the ESP32 no
     // clean TCP close to notice either — it just sits there as a zombie
@@ -1252,11 +1741,8 @@ static void handleRoot()
     // accumulating stale connections in the background every 3 seconds —
     // exactly the kind of buildup that leaves a *later*, unrelated page
     // navigation stuck waiting behind them.
-    html += "var __pc=new AbortController();";
-    html += "var __pt=setTimeout(function(){__pc.abort();},2500);";
-    html += "fetch('/motion/status',{cache:'no-store',signal:__pc.signal}).then(function(r){clearTimeout(__pt);return r.json();})";
-    html += ".then(function(s){updateHomeUI(s);}).catch(function(){clearTimeout(__pt);});";
-    html += "},3000);";
+    html += "<script>";
+    html += HOME_JS;
     html += "</script>";
 
     html += "</div>"; // end tab-home
@@ -1266,56 +1752,45 @@ static void handleRoot()
   // ====== USERS PANEL ======
   if (isAdmin && isUsers)
   {
-    html += "<div id='tab-users' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128100; User Management</div>";
-    html += "<div class='section-sub'>List of registered users</div>";
+    String addBtn = userCount < MAX_USERS ? "<a href='/add' class='btn btn-primary'><i class='ic ic-plus'></i>Add user</a>" : "";
+    html += "<div id='tab-users' class='page'>";
+    html += panelHead("users", "User Management", "Everyone who can sign in to the mobile app and this portal", addBtn);
 
-    html += "<div class='table-wrap' style='position:relative;'>";
-    // + button pinned to top-right of the table header row
-    if (userCount < MAX_USERS)
-    {
-      html += "<a href='/add' title='Add New User' "
-              "style='position:absolute;top:6px;right:8px;z-index:10;"
-              "width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.22);"
-              "color:#fff;display:flex;align-items:center;justify-content:center;"
-              "font-size:20px;font-weight:700;text-decoration:none;line-height:1;"
-              "border:1.5px solid rgba(255,255,255,.45);transition:background .2s;'"
-              " onmouseover=\"this.style.background='rgba(255,255,255,.38)'\""
-              " onmouseout=\"this.style.background='rgba(255,255,255,.22)'\""
-              ">&#43;</a>";
-    }
-    html += "<table><thead><tr>"
-            "<th width='36'>#</th><th>Name</th><th>Email</th><th>Role</th><th>Access</th><th>Actions</th>"
+    html += "<div class='card card-flush'>";
+    html += "<div class='card-head'><h2>Registered users</h2><span class='grow'></span>"
+            "<span class='badge badge-blue'><i class='ic ic-users'></i>" +
+            String(userCount) + " / " + String(MAX_USERS) +
+            "</span></div>";
+    html += "<div class='table-wrap'><table class='stack'><thead><tr>"
+            "<th>User</th><th>Role</th><th>Access</th><th class='col-actions'>Actions</th>"
             "</tr></thead><tbody>";
     for (int i = 0; i < userCount; i++)
     {
-      html += "<tr><td>" + String(i + 1) + "</td>";
-      html += "<td>" + String(users[i].name) + "</td>";
-      html += "<td>" + String(users[i].email) + "</td>";
-      html += "<td><span class='badge'>" + String(users[i].role) + "</span></td>";
-      html += "<td>" + accessLabel(users[i]) + "</td>";
-      html += "<td>";
+      String idx = String(i);
+      String uname = String(users[i].name);
+      html += "<tr><td class='cell-main'><div class='cell-user'><span class='avatar'>" + htmlEsc(initialOf(uname)) +
+              "</span><div><b>" + htmlEsc(uname) + "</b><small>" + htmlEsc(String(users[i].email)) + "</small></div></div></td>";
+      html += "<td data-label='Role'>" + roleBadge(users[i].role) + "</td>";
+      html += "<td data-label='Access'>" + accessCell(users[i]) + "</td>";
+      html += "<td class='col-actions'><div class='actions'>";
       if (isSuper || String(users[i].role) != "Admin")
       {
-        html += "<a href='/edit?idx=" + String(i) + "' class='btn btn-edit'>&#9998; Edit</a>&nbsp;";
-        html += "<a href='/confirm-delete?idx=" + String(i) + "' class='btn btn-danger'>Delete</a>&nbsp;";
-        html += "<a href='/login-as?idx=" + String(i) + "' class='btn btn-outline' title='Login as this user'>&#128100; Login As</a>";
+        html += actionLink("/edit?idx=" + idx, "btn-outline", "edit", "Edit", "Edit user");
+        html += actionLink("/login-as?idx=" + idx, "btn-outline", "login", "Login as", "Sign in as this user");
+        html += actionLink("/confirm-delete?idx=" + idx, "btn-danger-outline", "trash", "Delete", "Delete user");
       }
       else
       {
-        html += "<span style='color:#94A3B8;font-size:13px;'>Super Admin only</span>";
+        html += "<span class='badge'><i class='ic ic-shield'></i>Super Admin only</span>";
       }
-      html += "</td></tr>";
+      html += "</div></td></tr>";
+      mayFlush();
     }
     if (userCount == 0)
     {
-      html += "<tr><td colspan='6' style='text-align:center;color:#94A3B8;padding:20px;'>"
-              "No users yet. Press &#43; to add one.</td></tr>";
+      html += "<tr><td colspan='4' class='empty'>No users yet. Use &ldquo;Add user&rdquo; to create the first one.</td></tr>";
     }
-    html += "</tbody></table>";
-    html += "</div>"; // end table-wrap
-    html += "<div style='margin-bottom:20px;'><span class='badge'>&#128100; " + String(userCount) + " / " + String(MAX_USERS) + " users</span></div>";
-
+    html += "</tbody></table></div></div>";
     html += "</div>"; // end tab-users
   } // end if(isAdmin) users panel
   mayFlush(); // flush users panel
@@ -1323,38 +1798,49 @@ static void handleRoot()
   // ====== DEVICES PANEL ======
   if (isAdmin && isDevices)
   {
-    html += "<div id='tab-devices' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128241; Device Registry</div>";
-    html += "<div class='section-sub'>Registered mobile devices (max " + String(MAX_DEVICES) + ")</div>";
+    html += "<div id='tab-devices' class='page'>";
+    html += panelHead("phone", "Device Registry", "Mobile devices allowed to connect (maximum " + String(MAX_DEVICES) + ")");
 
-    html += "<div class='table-wrap' style='position:relative;'>";
     if (deviceCount < MAX_DEVICES)
     {
-      html += "<form method='POST' action='/devices' style='position:absolute;top:6px;right:8px;z-index:10;'>";
-      html += "<input type='text' name='id' placeholder='Device ID' required maxlength='40' style='padding:6px;border-radius:7px;border:1px solid #E2E8F0;margin-right:6px;'>";
-      html += "<input type='text' name='owner' placeholder='Owner email (optional)' maxlength='64' style='padding:6px;border-radius:7px;border:1px solid #E2E8F0;margin-right:6px;'>";
-      html += "<button type='submit' class='btn btn-primary' style='padding:6px 10px;font-size:13px;'>Add</button>";
-      html += "</form>";
+      html += "<div class='card'><h2 class='section-h'>Register a device</h2>";
+      html += "<form method='POST' action='/devices' class='inline-form'>";
+      html += "<div class='form-group'><label for='dev-id'>Device ID</label>"
+              "<input id='dev-id' type='text' name='id' placeholder='Device ID' required maxlength='40' autocomplete='off'></div>";
+      html += "<div class='form-group'><label for='dev-owner'>Owner email <span class='opt'>(optional)</span></label>"
+              "<input id='dev-owner' type='text' name='owner' placeholder='owner@example.com' maxlength='64' autocomplete='off'></div>";
+      html += "<button type='submit' class='btn btn-primary'><i class='ic ic-plus'></i>Register</button>";
+      html += "</form></div>";
     }
-    html += "<table><thead><tr><th width='36'>#</th><th>Device ID</th><th>Owner</th><th>Actions</th></tr></thead><tbody>";
+    else
+    {
+      html += alertHtml("info", "The registry is full. Delete a device to register another one.");
+    }
+
+    html += "<div class='card card-flush'>";
+    html += "<div class='card-head'><h2>Registered devices</h2><span class='grow'></span>"
+            "<span class='badge badge-blue'><i class='ic ic-phone'></i>" +
+            String(deviceCount) + " / " + String(MAX_DEVICES) +
+            "</span></div>";
+    html += "<div class='table-wrap'><table class='stack'><thead><tr>"
+            "<th>Device ID</th><th>Owner</th><th class='col-actions'>Actions</th></tr></thead><tbody>";
     for (int i = 0; i < deviceCount; i++)
     {
-      html += "<tr><td>" + String(i + 1) + "</td>";
-      html += "<td>" + String(devices[i].id) + "</td>";
-      html += "<td>" + String(devices[i].owner) + "</td>";
-      html += "<td>";
-      html += "<form method='POST' action='/devices/delete' style='display:inline-block;margin:0;padding:0;'>";
+      String owner = String(devices[i].owner);
+      html += "<tr><td class='cell-main'><span class='mono'>" + htmlEsc(String(devices[i].id)) + "</span></td>";
+      html += "<td data-label='Owner'>" + (owner.length() > 0 ? htmlEsc(owner) : String("&mdash;")) + "</td>";
+      html += "<td class='col-actions'><div class='actions'>";
+      html += "<form method='POST' action='/devices/delete'>";
       html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
-      html += "<button type='submit' class='btn btn-danger'>Delete</button>";
-      html += "</form>";
-      html += "</td></tr>";
+      html += "<button type='submit' class='btn btn-sm btn-danger-outline' title='Delete device' aria-label='Delete device'>"
+              "<i class='ic ic-trash'></i><span class='lbl'>Delete</span></button>";
+      html += "</form></div></td></tr>";
     }
     if (deviceCount == 0)
     {
-      html += "<tr><td colspan='4' style='text-align:center;color:#94A3B8;padding:20px;'>No devices registered.</td></tr>";
+      html += "<tr><td colspan='3' class='empty'>No devices registered.</td></tr>";
     }
-    html += "</tbody></table>";
-    html += "</div>"; // end table-wrap
+    html += "</tbody></table></div></div>";
     html += "</div>"; // end tab-devices
   }
   mayFlush();
@@ -1362,34 +1848,33 @@ static void handleRoot()
   // ====== OTA FIRMWARE UPDATE PANEL ======
   if (isAdmin && isOta)
   {
-    html += "<div id='tab-ota' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128260; Firmware Update</div>";
-    html += "<div class='section-sub'>Upload a new firmware (.bin) image to update this device over the network.</div>";
+    html += "<div id='tab-ota' class='page page-narrow'>";
+    html += panelHead("cloud", "Firmware Update", "Upload a new firmware (.bin) image to update this device over the network.");
     html += "<div class='card'>";
-    html += "<div class='form-group'><label>Current firmware version</label><div><strong>" FIRMWARE_VERSION "</strong></div></div>";
-    html += "<div class='alert alert-danger' style='margin-bottom:16px;'>&#9888; All outputs (including any active motion output) will be forced OFF and E-STOP latched the instant the upload starts. The device will restart automatically once the update finishes. Do not close this page, remove power, or leave the machine unattended until it reconnects.</div>";
+    html += "<div class='form-group'><span class='field-label'>Current firmware version</span><div><strong>" FIRMWARE_VERSION "</strong></div></div>";
+    html += alertHtml("warn", "All outputs (including any active motion output) will be forced OFF and E-STOP latched the instant the upload starts. The device will restart automatically once the update finishes. Do not close this page, remove power, or leave the machine unattended until it reconnects.");
     html += "<form id='ota-form' method='POST' action='/ota' enctype='multipart/form-data'>";
-    html += "<div class='form-group'><label>Firmware file (.bin)</label>";
-    html += "<input type='file' name='firmware' accept='.bin' required></div>";
-    html += "<div class='form-group' style='margin-top:12px;'><label style='display:flex;align-items:center;gap:8px;font-weight:400;'>";
-    html += "<input type='checkbox' id='ota-confirm' required style='width:auto;'> I understand outputs will be forced OFF and the device will restart.";
+    html += "<div class='form-group'><label for='ota-file'>Firmware file (.bin)</label>";
+    html += "<input id='ota-file' type='file' name='firmware' accept='.bin' required></div>";
+    html += "<div class='form-group'><label class='check' for='ota-confirm'>";
+    html += "<input type='checkbox' id='ota-confirm' required><span>I understand outputs will be forced OFF and the device will restart.</span>";
     html += "</label></div>";
-    html += "<div class='form-actions' style='margin-top:18px;'>";
-    html += "<button type='submit' id='ota-submit' class='btn btn-primary'>&#11014; Upload &amp; Update</button>";
+    html += "<div class='form-actions'>";
+    html += "<button type='submit' id='ota-submit' class='btn btn-primary'><i class='ic ic-upload'></i>Upload &amp; update</button>";
     html += "</div>";
-    html += "<div id='ota-status' style='margin-top:14px;'></div>";
+    html += "<div id='ota-status'></div>";
     html += "</form>";
     html += "</div>"; // end card
-    html += "<script>";
-    html += "(function(){";
-    html += "var f=document.getElementById('ota-form');";
-    html += "if(!f)return;";
-    html += "f.addEventListener('submit',function(){";
-    html += "document.getElementById('ota-submit').disabled=true;";
-    html += "document.getElementById('ota-status').innerHTML=\"<div class='alert alert-info'>Uploading firmware — this can take a minute, please wait...</div>\";";
-    html += "});";
-    html += "})();";
-    html += "</script>";
+    html += R"JS(<script>
+(function(){
+var f=document.getElementById('ota-form');
+if(!f)return;
+f.addEventListener('submit',function(){
+document.getElementById('ota-submit').disabled=true;
+document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><i class='ic ic-info'></i><div>Uploading firmware — this can take a minute, please wait...</div></div><div class='progress'><i></i></div>";
+});
+})();
+</script>)JS";
     html += "</div>"; // end tab-ota
   }
   mayFlush();
@@ -1397,40 +1882,43 @@ static void handleRoot()
   // ====== FILES PANEL (SD card) ======
   if (isAdmin && isFiles)
   {
-    html += "<div id='tab-files' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128193; Files</div>";
+    html += "<div id='tab-files' class='page'>";
     // dir=YYYY-MM shows the inside of a month folder; otherwise the SD root.
     String curDir = webServer.hasArg("dir") ? webServer.arg("dir") : String("");
     if (!validMonthStr(curDir))
       curDir = "";
-    html += "<div class='section-sub'>Files on the SD card. Event logs are saved in one folder per month (YYYY-MM), one file per day (YYYY-MM-DD.log).</div>";
+    html += panelHead("folder", "Files",
+                      "Files on the SD card. Event logs are saved in one folder per month (YYYY-MM), one file per day (YYYY-MM-DD.log).");
     if (curDir.length() > 0)
     {
-      html += "<div style='margin-bottom:14px;'><a href='/?tab=files' class='btn btn-outline'>&#8592; All files</a> "
-              "<span class='badge'>&#128193; " + curDir + "</span></div>";
+      html += "<div class='crumbs'><a href='/?tab=files' class='btn btn-sm btn-outline'><i class='ic ic-left'></i>All files</a>"
+              "<span class='badge badge-blue'><i class='ic ic-folder'></i>" +
+              curDir + "</span></div>";
     }
 
     // Create-new-file form (SD root only)
     if (curDir.length() == 0)
     {
-    html += "<div class='card' style='margin-bottom:16px;'>";
-    html += "<form method='POST' action='/files/new' style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0;'>";
-    html += "<input type='text' name='name' placeholder='New file name, e.g. notes.txt' required maxlength='60' "
-            "style='flex:1;min-width:220px;padding:9px 12px;border:1px solid #E2E8F0;border-radius:7px;'>";
-    html += "<button type='submit' class='btn btn-primary'>&#43; Create File</button>";
-    html += "</form></div>";
+      html += "<div class='card'><h2 class='section-h'>New file</h2>";
+      html += "<form method='POST' action='/files/new' class='inline-form'>";
+      html += "<div class='form-group'><label for='new-file'>File name</label>"
+              "<input id='new-file' type='text' name='name' placeholder='e.g. notes.txt' required maxlength='60' autocomplete='off'></div>";
+      html += "<button type='submit' class='btn btn-primary'><i class='ic ic-plus'></i>Create file</button>";
+      html += "</form></div>";
     }
     mayFlush();
 
     File root;
     if (!sdOpen("/" + curDir, FILE_READ, root) || !root.isDirectory())
     {
-      html += "<div class='alert alert-danger'>&#9888; SD card not available. Check that the card is inserted.</div>";
+      html += alertHtml("danger", "SD card not available. Check that the card is inserted.");
     }
     else
     {
-      html += "<div class='table-wrap'><table><thead><tr>"
-              "<th width='36'>#</th><th>File name</th><th>Size</th><th>Entries</th><th>Actions</th>"
+      html += "<div class='card card-flush'>";
+      html += "<div class='card-head'><h2>" + String(curDir.length() > 0 ? curDir : String("SD card")) + "</h2></div>";
+      html += "<div class='table-wrap'><table class='stack'><thead><tr>"
+              "<th>File name</th><th>Size</th><th>Entries</th><th class='col-actions'>Actions</th>"
               "</tr></thead><tbody>";
       unsigned long countDeadline = millis() + 2500; // total time allowed for line counting
       int rows = 0;
@@ -1447,10 +1935,13 @@ static void handleRoot()
           if (curDir.length() == 0 && validMonthStr(dn))
           {
             rows++;
-            html += "<tr><td>" + String(rows) + "</td>";
-            html += "<td>&#128193; <a href='/?tab=files&dir=" + dn + "'>" + dn + "</a></td>";
-            html += "<td>&mdash;</td><td>&mdash;</td>";
-            html += "<td><a href='/?tab=files&dir=" + dn + "' class='btn btn-outline'>Open folder</a></td></tr>";
+            html += "<tr><td class='cell-main'><a class='file-name' href='/?tab=files&dir=" + dn +
+                    "'><i class='ic ic-folder'></i>" + dn + "</a></td>";
+            html += "<td data-label='Size'>&mdash;</td><td data-label='Entries'>&mdash;</td>";
+            html += "<td class='col-actions'><div class='actions'>"
+                    "<a href='/?tab=files&dir=" +
+                    dn + "' class='btn btn-sm btn-outline'><i class='ic ic-folder'></i>Open folder</a>"
+                         "</div></td></tr>";
             mayFlush();
           }
         }
@@ -1463,23 +1954,22 @@ static void handleRoot()
           String pathName = curDir.length() > 0 ? curDir + "/" + nm : nm; // name as used by /files/* routes
           long entries = countEntries(e, countDeadline);
           rows++;
-          html += "<tr><td>" + String(rows) + "</td>";
-          html += "<td>" + htmlEsc(nm) + "</td>";
-          html += "<td>" + formatSize(e.size()) + "</td>";
-          html += "<td>" + (entries >= 0 ? String(entries) : String("&mdash;")) + "</td>";
-          html += "<td>";
+          html += "<tr><td class='cell-main'><span class='file-name'><i class='ic ic-file'></i>" + htmlEsc(nm) + "</span></td>";
+          html += "<td data-label='Size'>" + formatSize(e.size()) + "</td>";
+          html += "<td data-label='Entries'>" + (entries >= 0 ? String(entries) : String("&mdash;")) + "</td>";
+          html += "<td class='col-actions'><div class='actions'>";
           if (validSdName(nm))
           {
             String q = urlEnc(pathName);
-            html += "<a href='/files/download?name=" + q + "' class='btn btn-outline'>&#11015; Download</a>&nbsp;";
-            html += "<a href='/files/edit?name=" + q + "' class='btn btn-edit'>&#9998; View / Edit</a>&nbsp;";
-            html += "<a href='/files/confirm-delete?name=" + q + "' class='btn btn-danger'>Delete</a>";
+            html += actionLink("/files/download?name=" + q, "btn-outline", "download", "Download", "Download file");
+            html += actionLink("/files/edit?name=" + q, "btn-outline", "edit", "View / Edit", "View or edit file");
+            html += actionLink("/files/confirm-delete?name=" + q, "btn-danger-outline", "trash", "Delete", "Delete file");
           }
           else
           {
-            html += "<span style='color:#94A3B8;'>unsupported name</span>";
+            html += "<span class='badge'>Unsupported name</span>";
           }
-          html += "</td></tr>";
+          html += "</div></td></tr>";
           mayFlush();
         }
         e.close();
@@ -1490,9 +1980,9 @@ static void handleRoot()
       root.close();
       if (rows == 0)
       {
-        html += "<tr><td colspan='5' style='text-align:center;color:#94A3B8;padding:20px;'>No files on the SD card yet.</td></tr>";
+        html += "<tr><td colspan='4' class='empty'>No files on the SD card yet.</td></tr>";
       }
-      html += "</tbody></table></div>";
+      html += "</tbody></table></div></div>";
     }
     html += "</div>"; // end tab-files
   }
@@ -1503,21 +1993,21 @@ static void handleRoot()
   {
     bool savedOk = webServer.hasArg("saved");
     bool dupErr = webServer.hasArg("err") && webServer.arg("err") == "dup";
-    html += "<div id='tab-outconfig' class='tab-panel active'>";
-    html += "<div class='section-title'>&#9881; Output Configuration</div>";
-    html += "<div class='section-sub'>Assign each physical output pin to a DF function and choose the motion for that pin.</div>";
+    html += "<div id='tab-outconfig' class='page'>";
+    html += panelHead("sliders", "Output Configuration",
+                      "Assign each physical output pin to a DF function and choose the motion for that pin.");
     if (savedOk)
     {
-      html += "<div class='alert alert-info'>&#10003; Configuration saved successfully.</div>";
+      html += alertHtml("success", "Configuration saved successfully.");
     }
     if (dupErr)
     {
-      html += "<div class='alert alert-danger'>&#9888; Save failed: each output must have a unique function and motion.</div>";
+      html += alertHtml("danger", "Save failed: each output must have a unique function and motion.");
     }
     html += "<form id='oc-form' method='POST' action='/outconfig'>";
-    html += "<div class='card' style='padding:0;overflow:hidden;'>";
-    html += "<table>";
-    html += "<thead><tr><th>Physical Pin</th><th>Digital Function</th><th>Motion</th></tr></thead>";
+    html += "<div class='card card-flush'>";
+    html += "<div class='table-wrap'><table class='stack stack-form stack-pair'>";
+    html += "<thead><tr><th>Physical pin</th><th>Digital function</th><th>Motion</th></tr></thead>";
     html += "<tbody>";
 
     // Build one select dropdown row for each physical output pin
@@ -1525,15 +2015,16 @@ static void handleRoot()
     {
       uint8_t currentFunction = pinMotionConfig[p].function;
       uint8_t currentMotion = pinMotionConfig[p].motion;
-      html += "<tr class='oc-row'>";
-      html += "<td class='oc-pin'>" + String(OUTPUT_PINS[p].label) + "</td>";
-      html += "<td><select name='pin_" + String(p) + "_function' class='oc-select'>";
+      html += "<tr><td class='cell-main'><span class='pin'>" + String(OUTPUT_PINS[p].label) + "</span></td>";
+      html += "<td data-label='Digital function'><select name='pin_" + String(p) + "_function' aria-label='Digital function for " +
+              String(OUTPUT_PINS[p].label) + "'>";
       for (int f = 0; f < NUM_OUTPUT_PINS; f++)
       {
         html += "<option value='" + String(f) + "'" + String(currentFunction == f ? " selected" : "") + ">" + String(OUTPUT_FUNCTIONS[f]) + "</option>";
       }
       html += "</select></td>";
-      html += "<td><select name='pin_" + String(p) + "_motion' class='oc-select'>";
+      html += "<td data-label='Motion'><select name='pin_" + String(p) + "_motion' aria-label='Motion for " +
+              String(OUTPUT_PINS[p].label) + "'>";
       html += "<option value='0'" + String(currentMotion == MOTION_NONE ? " selected" : "") + ">";
       html += "&#8212; None &#8212;</option>";
       uint8_t motions[] = {MOTION_ESTOP, MOTION_UP, MOTION_DOWN, MOTION_LEFT, MOTION_RIGHT};
@@ -1545,11 +2036,11 @@ static void handleRoot()
       html += "</select></td></tr>";
     }
 
-    html += "</tbody></table>";
+    html += "</tbody></table></div>";
     html += "</div>"; // end card
-    html += "<div id='oc-save-msg' class='alert alert-info' style='display:none;margin-top:14px;'></div>";
-    html += "<div class='form-actions' style='margin-top:18px;'>";
-    html += "<button id='oc-save-btn' type='submit' class='btn btn-primary'>&#10003; Save Configuration</button>";
+    html += "<div id='oc-save-msg' class='alert alert-info' hidden></div>";
+    html += "<div class='form-actions bare'>";
+    html += "<button id='oc-save-btn' type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save configuration</button>";
     html += "</div>";
     html += "</form>";
 
@@ -1557,41 +2048,9 @@ static void handleRoot()
     // panel's own markup (moved here from the old shared bottom script) so
     // it works both on a full page load and as an AJAX fragment swap.
     html += "<script>";
-    html += "(function(){";
-    html += "var f=document.getElementById('oc-form');if(!f)return;";
-    html += "var b=document.getElementById('oc-save-btn');";
-    html += "var m=document.getElementById('oc-save-msg');";
-    html += "function setMsg(ok,msg){if(!m)return;m.style.display='block';m.className='alert '+(ok?'alert-info':'alert-danger');m.textContent=msg;}";
-    html += "f.addEventListener('submit',function(e){e.preventDefault();";
-    html += "var functions=[];";
-    html += "var motions=[];";
-    html += "for(var p=0;p<" + String(NUM_OUTPUT_PINS) + ";p++){";
-    html += "var fsel=f.elements['pin_'+p+'_function']; if(fsel){functions.push(fsel.value);}";
-    html += "var msel=f.elements['pin_'+p+'_motion']; if(msel){motions.push(msel.value);}";
-    html += "}";
-    html += "var noneVal='0';";
-    html += "var funcSeen={};";
-    html += "for(var i=0;i<functions.length;i++){";
-    html += "if(funcSeen[functions[i]]){setMsg(false,'Save failed: each output must have a unique digital function.');return;}";
-    html += "funcSeen[functions[i]]=true;}";
-    html += "var motSeen={};";
-    html += "for(var i=0;i<motions.length;i++){";
-    html += "if(motions[i]!==noneVal){";
-    html += "if(motSeen[motions[i]]){setMsg(false,'Save failed: two outputs cannot be assigned the same motion.');return;}";
-    html += "motSeen[motions[i]]=true;}";
-    html += "}";
-    html += "if(b)b.disabled=true;";
-    html += "var body=new URLSearchParams(new FormData(f)).toString();";
-    html += "fetch('/outconfig',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'},body:body})";
-    html += ".then(function(r){return r.json().then(function(j){return {ok:r.ok,body:j};});})";
-    html += ".then(function(x){";
-    html += "if(!x.ok||!x.body||!x.body.ok)throw new Error((x.body&&x.body.msg)?x.body.msg:'Save failed. Please try again.');";
-    html += "setMsg(true,'Configuration saved successfully.');";
-    html += "})";
-    html += ".catch(function(err){setMsg(false,(err&&err.message)?err.message:'Save failed. Please try again.');})";
-    html += ".finally(function(){if(b)b.disabled=false;});";
-    html += "});";
-    html += "})();";
+    html += OC_JS_A;
+    html += String(NUM_OUTPUT_PINS);
+    html += OC_JS_B;
     html += "</script>";
 
     html += "</div>"; // end tab-outconfig
@@ -1602,48 +2061,33 @@ static void handleRoot()
   if ((isAdmin || isOperator) && isNetwork)
   {
     bool savedOk = webServer.hasArg("saved");
-    html += "<div id='tab-network' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128246; Network Settings</div>";
-    html += "<div class='section-sub'>Configure BLE name, WiFi SSID and password.</div>";
+    html += "<div id='tab-network' class='page page-narrow'>";
+    html += panelHead("wifi", "Network Settings", "Configure the Bluetooth name and the Wi-Fi network this device broadcasts.");
     if (savedOk)
     {
-      html += "<div class='alert alert-info'>&#10003; Network settings saved. Restarting device...</div>";
+      html += alertHtml("success", "Network settings saved. Restarting device...");
     }
+    html += alertHtml("info", "The device restarts automatically after saving new Bluetooth or Wi-Fi credentials. Reconnect to the new Wi-Fi network once it is back.");
     html += "<form id='net-form' method='POST' action='/netconfig'>";
-    html += "<div class='card' style='padding:0;overflow:hidden;'>";
-    html += "<div style='padding:18px;'>";
-    html += "<div class='form-group'><label>BLE Device Name</label>";
-    html += "<input type='text' name='ble_name' value='" + String(bleName) + "' placeholder='RRC_' minlength='5' maxlength='10' required pattern='RRC_.{1,6}'>";
+    html += "<div class='card'>";
+    html += "<div class='form-row'>";
+    html += "<div class='form-group'><label for='net-ble'>Bluetooth device name</label>";
+    html += "<input id='net-ble' type='text' name='ble_name' value='" + htmlEsc(String(bleName)) +
+            "' placeholder='RRC_' minlength='5' maxlength='10' required pattern='RRC_.{1,6}'>";
+    html += "<div class='form-hint'>Starts with RRC_ &middot; 5&ndash;10 characters</div></div>";
+    html += "<div class='form-group'><label for='net-ssid'>Wi-Fi network name (SSID)</label>";
+    html += "<input id='net-ssid' type='text' name='wifi_ssid' value='" + htmlEsc(String(wifiSsid)) +
+            "' minlength='5' maxlength='10' required>";
+    html += "<div class='form-hint'>5&ndash;10 characters</div></div>";
     html += "</div>";
-    html += "<div class='form-group'><label>WiFi SSID</label>";
-    html += "<input type='text' name='wifi_ssid' value='" + String(wifiSsid) + "' minlength='5' maxlength='10' required>";
-    html += "</div>";
-    html += "<div class='form-group'><label>WiFi Password</label>";
-    html += "<input id='wifi-password' type='password' name='wifi_password' value='" + String(wifiPassword) + "' minlength='8' maxlength='10' required>";
-    html += "<div style=\"margin-top:8px;display:flex;align-items:center;gap:8px;font-size:14px;color:#1E293B;\">";
-    html += "<input id='toggle-wifi-password' type='checkbox' onchange='toggleWifiPassword()'>";
-    html += "<label for='toggle-wifi-password' style='margin:0;cursor:pointer;'>Show password</label>";
-    html += "</div>";
-    html += "</div>";
-    html += "<div style='font-size:13px;color:#64748B;margin-bottom:12px;'>The device will restart automatically after saving new BLE or WiFi credentials.</div>";
+    html += "<div class='form-group'><label for='wifi-password'>Wi-Fi password</label>";
+    html += passwordField("wifi-password", "wifi_password", "", htmlEsc(String(wifiPassword)), "minlength='8' maxlength='10' required");
+    html += "<div class='form-hint'>8&ndash;10 characters</div></div>";
+    html += "<div class='form-actions'>";
+    html += "<button id='net-save-btn' type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save network settings</button>";
     html += "</div>";
     html += "</div>"; // end card
-    html += "<div class='form-actions' style='margin-top:18px;'>";
-    html += "<button id='net-save-btn' type='submit' class='btn btn-primary'>&#10003; Save Network Settings</button>";
-    html += "</div>";
     html += "</form>";
-
-    // Moved here from the old shared bottom script so it travels with this
-    // panel's own markup, working both on a full page load and as an AJAX
-    // fragment swap.
-    html += "<script>";
-    html += "function toggleWifiPassword(){";
-    html += "var pw=document.getElementById('wifi-password');";
-    html += "if(!pw)return;";
-    html += "pw.type = (pw.type === 'password' ? 'text' : 'password');";
-    html += "}";
-    html += "</script>";
-
     html += "</div>"; // end tab-network
     mayFlush();
   }
@@ -1652,37 +2096,43 @@ static void handleRoot()
   if ((isAdmin || isOperator) && isTime)
   {
     bool savedOk = webServer.hasArg("saved");
-    html += "<div id='tab-time' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128337; Time &amp; Date</div>";
-    html += "<div class='section-sub'>View and correct the device's real-time clock, used to timestamp SD card event logs.</div>";
+    html += "<div id='tab-time' class='page'>";
+    html += panelHead("clock", "Time &amp; Date",
+                      "View and correct the device's real-time clock, used to timestamp SD card event logs.");
     if (savedOk)
     {
-      html += "<div class='alert alert-info'>&#10003; Device time updated.</div>";
+      html += alertHtml("success", "Device time updated.");
     }
     if (!rtcOk)
     {
-      html += "<div class='alert alert-danger'>&#9888; RTC hardware not detected — event log entries will show N/A for timestamp until this is resolved.</div>";
+      html += alertHtml("danger", "RTC hardware not detected — event log entries will show N/A for timestamp until this is resolved.");
     }
-    html += "<div class='card' style='padding:18px;margin-bottom:18px;'>";
-    html += "<div class='form-group'><label>Current Device Time</label>";
-    html += "<div style='font-size:20px;font-weight:600;'>" + currentTimestamp() + "</div>";
-    html += "</div>";
-    html += "</div>";
+    html += "<div class='grid'>";
+    {
+      String now = currentTimestamp(); // "YYYY-MM-DD HH:MM:SS", or "N/A"
+      html += "<div class='card'><div class='stat-title'>Current device time</div>";
+      if (now.length() == 19)
+      {
+        html += "<div class='clock'>" + now.substring(11) + "</div>";
+        html += "<div class='clock-date'>" + now.substring(0, 10) + "</div>";
+      }
+      else
+      {
+        html += "<div class='clock'>" + htmlEsc(now) + "</div>";
+      }
+      html += "</div>";
+    }
     if (rtcOk)
     {
       String isoNow = currentTimestamp();
       isoNow.replace(" ", "T");
-      html += "<form id='time-form' method='POST' action='/timeconfig'>";
-      html += "<div class='card' style='padding:18px;'>";
-      html += "<div class='form-group'><label>Set New Date &amp; Time</label>";
-      html += "<input type='datetime-local' name='device_time' step='1' value='" + isoNow + "' required>";
-      html += "</div>";
-      html += "</div>";
-      html += "<div class='form-actions' style='margin-top:18px;'>";
-      html += "<button type='submit' class='btn btn-primary'>&#10003; Set Device Time</button>";
-      html += "</div>";
-      html += "</form>";
+      html += "<div class='card'><form id='time-form' method='POST' action='/timeconfig'>";
+      html += "<div class='form-group'><label for='device-time'>Set new date &amp; time</label>";
+      html += "<input id='device-time' type='datetime-local' name='device_time' step='1' value='" + isoNow + "' required></div>";
+      html += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Set device time</button>";
+      html += "</form></div>";
     }
+    html += "</div>"; // end grid
     html += "</div>"; // end tab-time
     mayFlush();
   }
@@ -1691,26 +2141,25 @@ static void handleRoot()
   if ((isAdmin || isOperator) && isInConfig)
   {
     bool savedOk = webServer.hasArg("saved");
-    html += "<div id='tab-inconfig' class='tab-panel active'>";
-    html += "<div class='section-title'>&#128225; Input Configuration</div>";
-    html += "<div class='section-sub'>I0.7 and I0.8 share their pin with A0.7/A0.8 — choose digital or analog mode for each, then assign the input used for the mobile remote control.</div>";
+    html += "<div id='tab-inconfig' class='page'>";
+    html += panelHead("cpu", "Input Configuration",
+                      "I0.7 and I0.8 share their pin with A0.7/A0.8 — choose digital or analog mode for each, then assign the input used for the mobile remote control.");
     if (savedOk)
     {
-      html += "<div class='alert alert-info'>&#10003; Input configuration saved.</div>";
+      html += alertHtml("success", "Input configuration saved.");
     }
     html += "<script>function icOnRemoteChange(sel){if(sel.value=='1'){var all=document.querySelectorAll(\"select[name$='_remote']\");for(var i=0;i<all.length;i++){if(all[i]!==sel)all[i].value='0';}}}</script>";
     html += "<form method='POST' action='/inconfig'>";
-    html += "<div class='card' style='padding:0;overflow:hidden;'>";
-    html += "<table>";
+    html += "<div class='card card-flush'>";
+    html += "<div class='table-wrap'><table class='stack stack-form'>";
     html += "<thead><tr><th>Input</th><th>Mode</th><th>Assign</th></tr></thead><tbody>";
     for (int i = 0; i < NUM_INPUT_PINS; i++)
     {
-      html += "<tr class='oc-row'>";
-      html += "<td class='oc-pin'>" + String(INPUT_PINS[i].label) + "</td>";
-      html += "<td>";
+      html += "<tr><td class='cell-main'><span class='pin'>" + String(INPUT_PINS[i].label) + "</span></td>";
+      html += "<td data-label='Mode'>";
       if (INPUT_PINS[i].switchable)
       {
-        html += "<select name='in_" + String(i) + "_mode' class='oc-select'>";
+        html += "<select name='in_" + String(i) + "_mode' aria-label='Mode for " + String(INPUT_PINS[i].label) + "'>";
         html += "<option value='0'" + String(inputMode[i] == INPUT_MODE_DIGITAL ? " selected" : "") + ">Digital (" + String(INPUT_PINS[i].label) + ")</option>";
         html += "<option value='1'" + String(inputMode[i] == INPUT_MODE_ANALOG ? " selected" : "") + ">Analog (" + String(INPUT_PINS[i].analogLabel) + ")</option>";
         html += "</select>";
@@ -1720,19 +2169,18 @@ static void handleRoot()
         html += "<span class='badge'>Digital</span>";
       }
       html += "</td>";
-      html += "<td>";
-      html += "<select name='in_" + String(i) + "_remote' class='oc-select' onchange='icOnRemoteChange(this)'>";
+      html += "<td data-label='Assign'>";
+      html += "<select name='in_" + String(i) + "_remote' onchange='icOnRemoteChange(this)' aria-label='Assignment for " + String(INPUT_PINS[i].label) + "'>";
       html += "<option value='0'" + String(remoteInputIdx == i ? "" : " selected") + ">None</option>";
       html += "<option value='1'" + String(remoteInputIdx == i ? " selected" : "") + ">Remote Control</option>";
       html += "</select>";
       html += "</td></tr>";
     }
-    html += "</tbody></table>";
+    html += "</tbody></table></div>";
     html += "</div>"; // end card
 
-
-    html += "<div class='form-actions' style='margin-top:18px;'>";
-    html += "<button type='submit' class='btn btn-primary'>&#10003; Save Input Configuration</button>";
+    html += "<div class='form-actions bare'>";
+    html += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save input configuration</button>";
     html += "</div>";
     html += "</form>";
     html += "</div>"; // end tab-inconfig
@@ -1741,11 +2189,11 @@ static void handleRoot()
 
   if (!fragMode)
   {
-  html += "</div>"; // end main-content
-  html += "</div>"; // end layout
-  html += "</body></html>";
+    html += "</main>"; // end main-content
+    html += "</div>";  // end layout
+    html += "</body></html>";
   }
-  flush();                   // send final chunk and close chunked response
+  flush(); // send final chunk and close chunked response
   // Same dead-client guard as flush() above — a zero-length chunk write
   // to an already-gone (or just-detected-and-closed) client would
   // otherwise pay the same retry cost.
@@ -1762,35 +2210,36 @@ static void handleAddGet()
     return;
   if (userCount >= MAX_USERS)
   {
-    sendSafe(200, "text/html",
-                   pageHead("Add User", "Max users reached") +
-                       "<div class='card'><div class='alert alert-info'>Maximum users reached (" +
-                       String(MAX_USERS) + ").</div>"
-                                           "<a href='/?tab=users' class='btn btn-cancel'>&#8592; Back</a></div>" +
-                       pageFoot());
+    String full = pageHead("Add User", "Max users reached", "users", "users");
+    full += alertHtml("info", "Maximum users reached (" + String(MAX_USERS) + ").");
+    full += backButton("/?tab=users");
+    full += pageFoot();
+    sendSafe(200, "text/html", full);
     return;
   }
-  String html = pageHead("Add User", "Create a new BLE login credential");
+  String html = pageHead("Add User", "Create a new login for the mobile app and this portal", "users", "users");
   html += "<div class='card'>";
   html += "<form method='POST' action='/add'>";
-  html += "<div class='form-group'><label>Full Name</label>";
-  html += "<input type='text' name='name' placeholder='e.g. John Smith' required autofocus></div>";
-  html += "<div class='form-group'><label>Email Address</label>";
-  html += "<input type='email' name='email' placeholder='user@example.com' required></div>";
-  html += "<div class='form-group'><label>Password</label>";
-  html += "<input type='password' name='password' placeholder='Minimum 6 characters' "
-          "required minlength='6'></div>";
-  html += "<div class='form-group'><label>Role</label>";
-  html += "<select name='role' style='width:100%;padding:9px 12px;border:1px solid #E2E8F0;"
-          "border-radius:7px;font-size:14.5px;color:#1E293B;outline:none;background:#fff;'>";
+  html += "<div class='form-row'>";
+  html += "<div class='form-group'><label for='add-name'>Full name</label>";
+  html += "<input id='add-name' type='text' name='name' placeholder='e.g. John Smith' required autofocus></div>";
+  html += "<div class='form-group'><label for='add-email'>Email address</label>";
+  html += "<input id='add-email' type='email' name='email' placeholder='user@example.com' required></div>";
+  html += "</div>";
+  html += "<div class='form-row'>";
+  html += "<div class='form-group'><label for='add-pass'>Password</label>";
+  html += passwordField("add-pass", "password", "Minimum 6 characters", String(), "required minlength='6'");
+  html += "</div>";
+  html += "<div class='form-group'><label for='add-role'>Role</label><select name='role' id='add-role'>";
   html += "<option value='Operator'>Operator</option>";
   if (currentRole() == "SuperAdmin") // only the Super Admin may create Admins
     html += "<option value='Admin'>Admin</option>";
   html += "</select></div>";
+  html += "</div>";
   html += accessFormFields(nullptr);
   html += "<div class='form-actions'>";
-  html += "<button type='submit' class='btn btn-primary'>&#10003; Add User</button>";
-  html += "<a href='/?tab=users' class='btn btn-cancel'>&#8592; Cancel</a>";
+  html += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Add user</button>";
+  html += backButton("/?tab=users", "Cancel");
   html += "</div></form></div>";
   html += pageFoot();
   sendSafe(200, "text/html", html);
@@ -1933,15 +2382,15 @@ static void handleDeleteDevicePost()
 // upload (it gates every Update.write() call), not just the final
 // handler below — webAuthAdmin()'s redirect can't be used mid-upload,
 // so authorization here is a plain currentRole() check instead.
-static bool   otaAuthorized = false;
-static String otaErrorMsg   = "";
+static bool otaAuthorized = false;
+static String otaErrorMsg = "";
 
 static void handleOtaUpload()
 {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START)
   {
-    otaErrorMsg   = "";
+    otaErrorMsg = "";
     otaAuthorized = isManagerRole(currentRole());
     if (!otaAuthorized)
     {
@@ -2002,11 +2451,10 @@ static void handleOtaComplete()
     sendSafe(400, "text/html", errorPage("Update failed: " + msg, "/?tab=ota"));
     return;
   }
-  String html = pageHead("Firmware Update", "Update complete");
-  html += "<div class='card'>";
-  html += "<div class='alert alert-info'>&#10003; Firmware updated successfully. Restarting device...</div>";
-  html += "<p>Please wait while the device restarts, then reconnect once it comes back online.</p>";
-  html += "</div>";
+  String html = pageHead("Firmware Update", nullptr, "ota");
+  html += stateCard("ok", "check-circle", "Firmware updated",
+                    "The new firmware was written successfully. The device is restarting — reconnect once it comes back online.",
+                    "<div class='progress'><i></i></div>");
   html += pageFoot();
   sendSafe(200, "text/html", html);
   delay(500);
@@ -2028,21 +2476,22 @@ static void handleEditGet()
   }
   if (!webCanManageUser(idx))
     return;
-  String html = pageHead("Edit User", "Update login credentials");
+  String html = pageHead("Edit User", "Update login details and access", "users", "users");
   html += "<div class='card'><form method='POST' action='/edit'>";
   html += "<input type='hidden' name='idx' value='" + String(idx) + "'>";
-  html += "<div class='form-group'><label>Full Name</label>"
-          "<input type='text' name='name' value='" +
-          String(users[idx].name) + "' required></div>";
-  html += "<div class='form-group'><label>Email Address</label>"
-          "<input type='email' name='email' value='" +
-          String(users[idx].email) + "' required></div>";
-  html += "<div class='form-group'><label>Password</label>"
-          "<input type='text' name='password' value='" +
-          String(users[idx].password) + "' minlength='6'></div>";
-  html += "<div class='form-group'><label>Role</label>";
-  html += "<select name='role' style='width:100%;padding:9px 12px;border:1px solid #E2E8F0;"
-          "border-radius:7px;font-size:14.5px;color:#1E293B;outline:none;background:#fff;'>";
+  html += "<div class='form-row'>";
+  html += "<div class='form-group'><label for='edit-name'>Full name</label>"
+          "<input id='edit-name' type='text' name='name' value='" +
+          htmlEsc(String(users[idx].name)) + "' required></div>";
+  html += "<div class='form-group'><label for='edit-email'>Email address</label>"
+          "<input id='edit-email' type='email' name='email' value='" +
+          htmlEsc(String(users[idx].email)) + "' required></div>";
+  html += "</div>";
+  html += "<div class='form-row'>";
+  html += "<div class='form-group'><label for='edit-pass'>Password</label>"
+          "<input id='edit-pass' type='text' name='password' value='" +
+          htmlEsc(String(users[idx].password)) + "' minlength='6'></div>";
+  html += "<div class='form-group'><label for='edit-role'>Role</label><select name='role' id='edit-role'>";
   const char *roles[] = {"Operator", "Admin"};
   int roleCount = (currentRole() == "SuperAdmin") ? 2 : 1; // Admins can only assign Operator
   for (int r = 0; r < roleCount; r++)
@@ -2053,10 +2502,11 @@ static void handleEditGet()
     html += ">" + String(roles[r]) + "</option>";
   }
   html += "</select></div>";
+  html += "</div>";
   html += accessFormFields(&users[idx]);
   html += "<div class='form-actions'>";
-  html += "<button type='submit' class='btn btn-primary'>&#10003; Save Changes</button>";
-  html += "<a href='/?tab=users' class='btn btn-cancel'>Cancel</a>";
+  html += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save changes</button>";
+  html += backButton("/?tab=users", "Cancel");
   html += "</div></form></div>";
   html += pageFoot();
   sendSafe(200, "text/html", html);
@@ -2136,17 +2586,8 @@ static void handleConfirmDelete()
   }
   if (!webCanManageUser(idx))
     return;
-  String html = pageHead("Delete User", "This action cannot be undone");
-  html += "<div class='card'><div class='del-box'>";
-  html += "<div class='del-icon'>&#128465;</div>";
-  html += "<p class='del-msg'>Are you sure you want to delete</p>";
-  html += "<p class='del-email'>" + String(users[idx].email) + "</p>";
-  html += "<form method='POST' action='/delete'>";
-  html += "<input type='hidden' name='idx' value='" + String(idx) + "'>";
-  html += "<div class='del-btns'>";
-  html += "<button type='submit' class='btn btn-danger'>Yes, Delete</button>";
-  html += "<a href='/?tab=users' class='btn btn-cancel'>Cancel</a>";
-  html += "</div></form></div></div>";
+  String html = pageHead("Delete User", nullptr, "users");
+  html += confirmDeleteCard("/delete", "idx", String(idx), htmlEsc(String(users[idx].email)), "/?tab=users", "user");
   html += pageFoot();
   sendSafe(200, "text/html", html);
 }
@@ -2198,45 +2639,51 @@ static void handleAccountGet()
     }
   }
   String subtitle = isBleUser ? "Change your name and password" : "Change your web panel login credentials";
-  String html = pageHead("Account Settings", subtitle.c_str());
+  // Current password, pre-filled as this form has always done. A signed-in BLE
+  // user who has vanished from the list gets an empty field, never the web admin's.
+  String curPassVal = "";
+  if (isBleUser)
+  {
+    int ui = findUserIndexByEmail(_se.c_str());
+    if (ui >= 0)
+      curPassVal = String(users[ui].password);
+  }
+  else
+  {
+    curPassVal = String(webAdminPass);
+  }
+  String html = pageHead("Account Settings", subtitle.c_str(), nullptr, "user");
   html += "<div class='card'>";
+  html += "<div class='cell-user account-id'><span class='avatar'>" +
+          htmlEsc(initialOf(isBleUser ? currentName : currentId)) + "</span><div><b>" +
+          htmlEsc(isBleUser ? currentName : currentId) + "</b><small>" + roleLabel(currentRole()) + "</small></div></div>";
   html += "<form method='POST' action='/account'>";
   if (isBleUser)
   {
-    html += "<div class='form-group'><label>Full Name</label>";
-    html += "<input type='text' name='new_user' value='" + currentName + "' required></div>";
-    html += "<div class='form-group'><label>Email</label>";
-    html += "<input type='text' value='" + currentId + "' disabled style='width:100%;padding:9px 12px;"
-                                                       "border:1px solid #E2E8F0;border-radius:7px;font-size:14.5px;color:#94A3B8;background:#F1F5F9;'></div>";
+    html += "<div class='form-group'><label for='acc-name'>Full name</label>";
+    html += "<input id='acc-name' type='text' name='new_user' value='" + htmlEsc(currentName) + "' required></div>";
+    html += "<div class='form-group'><label for='acc-email'>Email</label>";
+    html += "<input id='acc-email' type='text' value='" + htmlEsc(currentId) + "' disabled></div>";
   }
   else
   {
-    html += "<div class='form-group'><label>Email Address</label>";
-    html += "<input type='email' name='new_user' value='" + currentId + "' required></div>";
+    html += "<div class='form-group'><label for='acc-email'>Email address</label>";
+    html += "<input id='acc-email' type='email' name='new_user' value='" + htmlEsc(currentId) + "' required></div>";
   }
-  html += "<div class='form-group'><label>Current Password</label>";
-  if (isBleUser)
-  {
-    for (int _i = 0; _i < userCount; _i++)
-    {
-      if (String(users[_i].email).equalsIgnoreCase(_se))
-      {
-        html += "<input type='text' name='cur_pass' value='" + String(users[_i].password) + "' required></div>";
-        break;
-      }
-    }
-  }
-  else
-  {
-    html += "<input type='text' name='cur_pass' value='" + String(webAdminPass) + "' required></div>";
-  }
-  html += "<div class='form-group'><label>New Password</label>";
-  html += "<input type='password' name='new_pass' placeholder='Leave blank to keep current'></div>";
-  html += "<div class='form-group'><label>Confirm New Password</label>";
-  html += "<input type='password' name='cfm_pass' placeholder='Repeat new password'></div>";
+  html += "<div class='form-section'><h3>Change password</h3>";
+  html += "<div class='form-group'><label for='acc-cur'>Current password</label>";
+  html += "<input id='acc-cur' type='text' name='cur_pass' value='" + htmlEsc(curPassVal) + "' required></div>";
+  html += "<div class='form-row'>";
+  html += "<div class='form-group'><label for='acc-new'>New password</label>";
+  html += passwordField("acc-new", "new_pass", "Leave blank to keep current");
+  html += "</div>";
+  html += "<div class='form-group'><label for='acc-cfm'>Confirm new password</label>";
+  html += passwordField("acc-cfm", "cfm_pass", "Repeat new password");
+  html += "</div>";
+  html += "</div></div>";
   html += "<div class='form-actions'>";
-  html += "<button type='submit' class='btn btn-primary'>&#10003; Save Changes</button>";
-  html += "<a href='/' class='btn btn-cancel'>&#8592; Back</a>";
+  html += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save changes</button>";
+  html += backButton("/", "Back");
   html += "</div></form></div>";
   html += pageFoot();
   sendSafe(200, "text/html", html);
@@ -2404,11 +2851,10 @@ static void handleNetConfigPost()
   newPass.toCharArray(wifiPassword, sizeof(wifiPassword));
   saveNetworkConfig();
 
-  String html = pageHead("Network Settings", "BLE and WiFi credentials updated.");
-  html += "<div class='card'>";
-  html += "<div class='alert alert-info'>&#10003; Saved successfully. Restarting device with new settings...</div>";
-  html += "<p>Please wait while the device restarts. Reconnect to the new WiFi SSID and BLE name after reboot.</p>";
-  html += "</div>";
+  String html = pageHead("Network Settings", nullptr, "network");
+  html += stateCard("ok", "check-circle", "Settings saved",
+                    "The device is restarting with its new settings. Reconnect to the new Wi-Fi network and Bluetooth name once it is back.",
+                    "<div class='progress'><i></i></div>");
   html += pageFoot();
   sendSafe(200, "text/html", html);
   delay(500);
@@ -2445,10 +2891,9 @@ static void handleTimeConfigPost()
   {
     Serial.printf("Web: FAILED to set device time to %04d-%02d-%02d %02d:%02d:%02d — write did not verify\n",
                   year, month, day, hour, minute, second);
-    sendSafe(500, "text/html", errorPage(
-        "Failed to set device time — the RTC did not accept the write. This usually means a wiring/connection "
-        "problem (e.g. missing pull-up resistors on SDA/SCL, or a loose RTC module). Please check the hardware and try again.",
-        "/?tab=time"));
+    sendSafe(500, "text/html", errorPage("Failed to set device time — the RTC did not accept the write. This usually means a wiring/connection "
+                                         "problem (e.g. missing pull-up resistors on SDA/SCL, or a loose RTC module). Please check the hardware and try again.",
+                                         "/?tab=time"));
     return;
   }
   Serial.printf("Web: device time set to %04d-%02d-%02d %02d:%02d:%02d\n", year, month, day, hour, minute, second);
@@ -2727,9 +3172,11 @@ static void handleFileEditGet()
   // Stream the page in chunks: the file's text is never held in RAM whole.
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   sendSafe(200, "text/html", "");
-  String head = pageHead("View / Edit File", htmlEsc(name).c_str());
+  String head = pageHead("View / Edit File", htmlEsc(name).c_str(), "files", "file", false);
   head += "<div class='card'>";
-  head += "<div style='margin-bottom:12px;color:#64748B;'>Size: " + formatSize(size) + "</div>";
+  head += "<div class='crumbs'><span class='badge'><i class='ic ic-database'></i>" + formatSize(size) + "</span>";
+  head += editable ? "<span class='badge badge-ok'>Editable</span>" : "<span class='badge badge-warn'>Read-only</span>";
+  head += "</div>";
   if (editable)
   {
     head += "<form method='POST' action='/files/save'>";
@@ -2737,15 +3184,12 @@ static void handleFileEditGet()
   }
   else
   {
-    head += "<div class='alert alert-info' style='margin-bottom:12px;'>This file is too large to edit here (limit " +
-            formatSize(FILE_EDIT_MAX_BYTES) + ")." +
-            (tailOnly ? String(" Showing only the last ") + formatSize(FILE_VIEW_MAX_BYTES) + "." : String("")) +
-            " Use Download to get the whole file.</div>";
+    head += alertHtml("info", "This file is too large to edit here (limit " + formatSize(FILE_EDIT_MAX_BYTES) + ")." +
+                                  (tailOnly ? String(" Showing only the last ") + formatSize(FILE_VIEW_MAX_BYTES) + "." : String("")) +
+                                  " Use Download to get the whole file.");
   }
-  head += "<textarea name='content' rows='22' maxlength='" + String(FILE_EDIT_MAX_BYTES) + "' spellcheck='false' " +
-          (editable ? "" : "readonly ") +
-          "style='width:100%;box-sizing:border-box;font-family:monospace;font-size:13px;padding:10px;"
-          "border:1px solid #E2E8F0;border-radius:7px;white-space:pre;overflow:auto;'>\n"; // first newline is ignored by the browser
+  head += "<textarea class='code' name='content' rows='22' maxlength='" + String(FILE_EDIT_MAX_BYTES) + "' spellcheck='false' " +
+          (editable ? "" : "readonly ") + ">\n"; // first newline is ignored by the browser
   webServer.sendContent(head);
 
   uint8_t buf[512];
@@ -2771,11 +3215,11 @@ static void handleFileEditGet()
   f.close();
 
   String tail = "</textarea>";
-  tail += "<div class='form-actions' style='margin-top:14px;'>";
+  tail += "<div class='form-actions'>";
   if (editable)
-    tail += "<button type='submit' class='btn btn-primary'>&#10003; Save Changes</button>";
-  tail += "<a href='/files/download?name=" + urlEnc(name) + "' class='btn btn-outline'>&#11015; Download</a>";
-  tail += "<a href='" + filesTabUrl(name) + "' class='btn btn-cancel'>&#8592; Back</a>";
+    tail += "<button type='submit' class='btn btn-primary'><i class='ic ic-check'></i>Save changes</button>";
+  tail += "<a href='/files/download?name=" + urlEnc(name) + "' class='btn btn-outline'><i class='ic ic-download'></i>Download</a>";
+  tail += backButton(filesTabUrl(name));
   tail += "</div>";
   tail += editable ? "</form></div>" : "</div>";
   tail += pageFoot();
@@ -2823,17 +3267,8 @@ static void handleFileConfirmDelete()
     sendSafe(404, "text/html", errorPage("File not found.", filesTabUrl(name).c_str()));
     return;
   }
-  String html = pageHead("Delete File", "This action cannot be undone");
-  html += "<div class='card'><div class='del-box'>";
-  html += "<div class='del-icon'>&#128465;</div>";
-  html += "<p class='del-msg'>Are you sure you want to delete</p>";
-  html += "<p class='del-email'>" + htmlEsc(name) + "</p>";
-  html += "<form method='POST' action='/files/delete'>";
-  html += "<input type='hidden' name='name' value='" + htmlEsc(name) + "'>";
-  html += "<div class='del-btns'>";
-  html += "<button type='submit' class='btn btn-danger'>Yes, Delete</button>";
-  html += "<a href='" + filesTabUrl(name) + "' class='btn btn-cancel'>Cancel</a>";
-  html += "</div></form></div></div>";
+  String html = pageHead("Delete File", nullptr, "files");
+  html += confirmDeleteCard("/files/delete", "name", htmlEsc(name), htmlEsc(name), filesTabUrl(name), "file");
   html += pageFoot();
   sendSafe(200, "text/html", html);
 }
@@ -2888,17 +3323,32 @@ static void handleFileNewPost()
 // ============================================================
 static void handleStyleCSS()
 {
-  // Bump the ETag whenever HTML_STYLE changes so browsers drop their cached copy.
-  if (webServer.header("If-None-Match") == "\"v3\"")
+  // The ETag is CSS_VER (see HTML_STYLE), so a changed stylesheet drops the cached copy.
+  webServer.sendHeader("Cache-Control", "public, max-age=86400");
+  webServer.sendHeader("ETag", "\"v" CSS_VER "\"");
+  if (webServer.header("If-None-Match") == "\"v" CSS_VER "\"")
   {
-    webServer.sendHeader("Cache-Control", "public, max-age=86400");
-    webServer.sendHeader("ETag", "\"v3\"");
     sendSafe(304);
     return;
   }
+  sendSafeP(200, "text/css", HTML_STYLE);
+}
+
+// ============================================================
+//  Logo  (GET /logo.png — streamed from flash, cached by browser)
+// ============================================================
+// Public like /style.css: the sign-in page shows it before anyone is logged in.
+// The ETag is LOGO_VER; bump it whenever src/web_logo.h is regenerated.
+static void handleLogoPNG()
+{
   webServer.sendHeader("Cache-Control", "public, max-age=86400");
-  webServer.sendHeader("ETag", "\"v3\"");
-  sendSafe(200, "text/css", HTML_STYLE);
+  webServer.sendHeader("ETag", "\"logo" LOGO_VER "\"");
+  if (webServer.header("If-None-Match") == "\"logo" LOGO_VER "\"")
+  {
+    sendSafe(304);
+    return;
+  }
+  sendSafeP(200, "image/png", (const char *)WEB_LOGO_PNG, WEB_LOGO_PNG_LEN);
 }
 
 void setupWebRoutes()
@@ -2908,6 +3358,7 @@ void setupWebRoutes()
   const char *hdrs[] = {"Cookie", "If-None-Match", "X-Requested-With"};
   webServer.collectHeaders(hdrs, 3);
   webServer.on("/style.css", HTTP_GET, handleStyleCSS);
+  webServer.on("/logo.png", HTTP_GET, handleLogoPNG);
   webServer.on("/login", HTTP_GET, handleLoginGet);
   webServer.on("/login", HTTP_POST, handleLoginPost);
   webServer.on("/logout", HTTP_GET, handleLogout);

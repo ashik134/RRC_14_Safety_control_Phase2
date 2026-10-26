@@ -625,16 +625,27 @@ Main features
 ================================================================================
 14. WEB PANEL PAGES AND HTTP ROUTES
 ================================================================================
- Single-page style dashboard with a left sidebar. Tab switching uses
- fetch() to load only the tab fragment (/?tab=X&frag=1) instead of a full page
- reload, to avoid exhausting the ESP32's few TCP sockets. Responses are
- streamed in ~4 KB chunks.
+ Single-page style dashboard: top bar, grouped left sidebar (Overview /
+ Management / Configuration / System, trimmed to the signed-in role) and a
+ content area. At <= 900 px wide the sidebar becomes a slide-in drawer opened
+ from a menu button, and on phones the tables turn into labelled cards. Tab
+ switching uses fetch() to load only the tab fragment (/?tab=X&frag=1) instead
+ of a full page reload, to avoid exhausting the ESP32's few TCP sockets.
+ Responses are streamed in ~4 KB chunks. The standalone pages (add / edit /
+ confirm / account / file editor / result pages) use the same shell.
+
+ Styling: one stylesheet (HTML_STYLE in web_handler.cpp) streamed from flash as
+ /style.css?v=<CSS_VER>. Icons are inline SVG masks inside that stylesheet, so
+ the UI never fetches anything from the internet. Bump CSS_VER whenever
+ HTML_STYLE changes so browsers drop their cached copy.
 
  Tabs
    home        : BLE connection state (Not Connected / Authenticating /
-                 Connected + user name) and Motion Status tags
-                 (E-STOP, UP, DOWN, LEFT, RIGHT). Updated live by polling
-                 /motion/status.
+                 Connected + user name), Motion Status indicators (E-STOP
+                 bar, UP, DOWN, LEFT, RIGHT) and a System summary (firmware,
+                 BLE name, Wi-Fi SSID, RTC and SD status, user / device counts
+                 for admins). Connection and motion are updated live by
+                 polling /motion/status.
    users       : (Admin) user table, add / edit / delete / login-as.
    devices     : (Admin) registered phones.
    ota         : (Admin) firmware upload form, shows FIRMWARE_VERSION.
