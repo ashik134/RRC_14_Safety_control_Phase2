@@ -270,7 +270,8 @@ Main features
         * encrypted replies, matched exactly by the app (no spaces):
             "AUTH_OK"           - success, the user's stored role is Admin
             "AUTH_OK|Operator"  - success, the user's stored role is Operator
-            "AUTH_FAIL", "AUTH_FAIL:OUT_OF_TIME", "AUTH_FAIL:UNTRUSTED_DEVICE"
+            "AUTH_FAIL", "AUTH_FAIL:OUT_OF_TIME", "AUTH_FAIL:UNTRUSTED_DEVICE",
+            "AUTH_FAIL:BAD_EMAIL", "AUTH_FAIL:BAD_PASSWORD"
           The role is read from the PLC's own user record; the login request
           carries none and the app cannot supply one.
         * also later "AUTH_FAIL:OUT_OF_TIME" (encrypted) when a timed user's
@@ -442,7 +443,8 @@ Main features
    |                                                |  isUserAccessAllowed()
    |                                                |  isDeviceRegistered()
    |<--- notify AUTH: Enc("AUTH_OK" | "AUTH_OK|Operator" | "AUTH_FAIL" |
-   |         "AUTH_FAIL:OUT_OF_TIME" | "AUTH_FAIL:UNTRUSTED_DEVICE")
+   |         "AUTH_FAIL:OUT_OF_TIME" | "AUTH_FAIL:UNTRUSTED_DEVICE" |
+   |         "AUTH_FAIL:BAD_EMAIL" | "AUTH_FAIL:BAD_PASSWORD")
    |<--- notify STATUS: Enc("1,0,0,0,0")   (only after AUTH_OK)
    |                                                |
    |---- write HEARTBEAT: Enc("HB") periodically -->|
@@ -463,7 +465,20 @@ Main features
    all OK, stored role Operator   -> AUTH_OK|Operator
    creds ok, time not allowed     -> AUTH_FAIL:OUT_OF_TIME
    creds ok, device unregistered  -> AUTH_FAIL:UNTRUSTED_DEVICE
-   anything else                  -> AUTH_FAIL
+   no user has this email         -> AUTH_FAIL:BAD_EMAIL
+   email known, password wrong    -> AUTH_FAIL:BAD_PASSWORD
+   anything else                  -> AUTH_FAIL   (valid creds, stored role not
+                                                  Admin/Operator)
+
+ BAD_EMAIL / BAD_PASSWORD let the app tell the user which of the two to fix,
+ whatever the device or access window. They are sent only while
+ AUTH_REPLY_NAMES_BAD_CREDENTIAL (main.cpp) is 1. The trade-off: anyone who can
+ complete the encrypted login handshake can tell whether an email has an
+ account. With it 0, both wrong-credential cases answer plain "AUTH_FAIL" as
+ before. The email match is the same exact (case-sensitive) comparison as the
+ login itself, and the Super Admin is never a BLE user, so its email is
+ BAD_EMAIL. The SD event log records BAD_EMAIL / BAD_PASSWORD either way. Apps
+ that predate these replies treat "AUTH_FAIL:<anything>" as a plain refusal.
 
  There are no special password values: login succeeds only when the email
  matches a stored user exactly and the password equals that user's stored
@@ -761,7 +776,8 @@ Main features
                role = Admin | Operator, from the PLC's stored user record.
    LOGOUT      "<name> (<email>) logged out"
    LOGIN_FAIL  failed BLE login: "<REASON> - email: <email>, device: <id>"
-               REASON = BAD_CREDENTIALS | OUT_OF_TIME | UNTRUSTED_DEVICE.
+               REASON = BAD_EMAIL | BAD_PASSWORD | OUT_OF_TIME | UNTRUSTED_DEVICE
+               | INVALID_ROLE (BAD_CREDENTIALS in firmware before this change).
                Rate limited to one entry per 3 s; skipped attempts are
                counted on the next entry. Email/device text is sanitised
                (control characters and commas replaced, max 40 chars).

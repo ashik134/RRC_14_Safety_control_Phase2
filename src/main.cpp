@@ -13,6 +13,7 @@
 #include "rtc10.h"
 #include "mbedtls/gcm.h"
 #include "web_handler.h"
+#include "ble_protocol.h"   // JSON wire format of the login / user-management / event-log characteristics
 #include "esp_gap_ble_api.h"
 #include "esp_log.h"
 #include "esp_bt.h"
@@ -423,13 +424,17 @@ void updateConnectionParams()
 }
 
 // AES-GCM decryption helper — accepts either hex text or raw bytes
-static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedLen, uint8_t *decrypted, size_t *decryptedLen) {
+// [decryptedCapacity] is the size of [decrypted]. GCM writes the plaintext before
+// the tag is checked, so a frame longer than the buffer is refused up front: it
+// cannot be allowed to run past the caller's buffer, whoever sent it.
+static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedLen, uint8_t *decrypted, size_t decryptedCapacity, size_t *decryptedLen) {
   if (encryptedLen < 12 + 16) return false; // need IV(12) + TAG(16)
 
   const uint8_t *iv = encrypted; // first 12 bytes
   const uint8_t *tag = encrypted + encryptedLen - 16; // last 16 bytes
   const uint8_t *cipher = encrypted + 12;
   size_t cipherLen = encryptedLen - 12 - 16;
+  if (cipherLen > decryptedCapacity) return false;
 
   mbedtls_gcm_context gcm;
   mbedtls_gcm_init(&gcm);
@@ -615,7 +620,7 @@ static void updateLastCounter(uint64_t sessionId, uint64_t counter) {
   sessionCounters[target].lastCounter = counter;
 }
 
-static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t *decrypted, size_t *decryptedLen, uint64_t &sessionId, uint64_t &counter) {
+static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t *decrypted, size_t decryptedCapacity, size_t *decryptedLen, uint64_t &sessionId, uint64_t &counter) {
   uint8_t encrypted[256];
   size_t encryptedLen = 0;
 
@@ -634,7 +639,7 @@ static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t
     return false;
   }
 
-  if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, decryptedLen)) {
+  if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, decryptedCapacity, decryptedLen)) {
     return false;
   }
 
@@ -642,7 +647,7 @@ static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t
   return true;
 }
 
-static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
+static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t decryptedCapacity, size_t *decryptedLen) {
   uint8_t buf[256];
   size_t bufLen = 0;
 
@@ -661,7 +666,7 @@ static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted
     Serial.println();
   }
 
-  return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
+  return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedCapacity, decryptedLen);
 }
 
 static int hexNibble(char c) {
@@ -839,6 +844,7 @@ BLECharacteristic *heartbeatChar = nullptr;
 
 bool     deviceConnected  = false;
 bool     authenticated    = false;
+bool     sessionJson      = false;   // the signed-in app logged in with a JSON (blep v1) message: unprompted notifications use JSON too
 char     connectedUserEmail[64] = "";
 uint16_t connId           = 0;        
 unsigned long connectTime = 0;
@@ -1404,6 +1410,28 @@ int checkCredentials(const std::string& email, const std::string& password) {
   return -1;
 }
 
+// Why checkCredentials() found nobody: no user has this email, or one does and
+// the password differs. Only meaningful after checkCredentials() returned -1.
+// Uses the same exact, case-sensitive email match and skips the same users, so
+// the two can never disagree about which email "exists".
+enum CredentialFault { CRED_BAD_EMAIL, CRED_BAD_PASSWORD };
+
+static CredentialFault credentialFault(const std::string& email) {
+  for (int i = 0; i < userCount; i++) {
+    if (strcmp(users[i].role, "SuperAdmin") == 0) continue;
+    if (email == users[i].email) return CRED_BAD_PASSWORD;
+  }
+  return CRED_BAD_EMAIL;
+}
+
+// Whether the login reply says WHICH of the email and the password was wrong
+// (AUTH_FAIL:BAD_EMAIL / AUTH_FAIL:BAD_PASSWORD) so the app can tell the user
+// what to fix. The cost: anyone who can complete the encrypted login handshake
+// can learn whether an email has an account. Set to 0 to answer every wrong
+// credential with error BAD_CREDENTIALS (JSON) / plain "AUTH_FAIL" (legacy)
+// again; the SD event log still records the detailed reason either way.
+#define AUTH_REPLY_NAMES_BAD_CREDENTIAL 1
+
 // The BLE login's success reply for [u], decided only from the role stored in
 // the PLC's own user record — the login request carries no role, and none is
 // ever taken from the app:
@@ -1438,6 +1466,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     deviceConnected = true;
     updateConnectionParams();
     authenticated   = false;
+    sessionJson     = false;
     connId          = param->connect.conn_id;
     connectTime     = millis();
     Serial.printf("Mobile connected — waiting for credentials (free heap: %u bytes)\n",
@@ -1468,6 +1497,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
     deviceConnected = false;
     authenticated   = false;
+    sessionJson     = false;
     connectedUserEmail[0] = '\0';
     logJobCancel    = true;
     Serial.println("Mobile disconnected");
@@ -1556,7 +1586,7 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
 
     uint8_t decrypted[256];
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, sizeof(decrypted), &decryptedLen)) {
       Serial.println("Auth: AES-GCM decryption failed");
       std::string outHex;
       if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
@@ -1578,28 +1608,53 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
     Serial.print("Auth: decrypted ASCII: ");
     Serial.println(reinterpret_cast<char*>(decrypted));
 
-    // Parse email|password|deviceid
+    // The request is a JSON message (ble_protocol.h, v1) or the older
+    // "email|password|deviceid" line, and the reply is sent in the same format.
     std::string s = reinterpret_cast<char*>(decrypted);
-    size_t sep1 = s.find('|');
-    size_t sep2 = (sep1 == std::string::npos) ? std::string::npos : s.find('|', sep1 + 1);
-    if (sep1 == std::string::npos || sep2 == std::string::npos) {
-      Serial.println("Auth: bad format — expected email|password|deviceid");
-      std::string outHex;
-      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
-        authChar->setValue(outHex);
-        authChar->notify();
+    const bool jsonReq = blep::isJson(s);
+    std::string email, password, deviceId;
+    if (jsonReq) {
+      blep::LoginRequest lr;
+      blep::ParseError pe = blep::parseLogin(s, lr);
+      if (pe != blep::ParseError::None) {
+        Serial.println("Auth: bad format — expected a JSON login message");
+        std::string outHex;
+        if (encryptAESGCM_packet(blep::loginFail(pe == blep::ParseError::BadVersion ? "BAD_VERSION" : "BAD_FORMAT"), outHex)) {
+          authChar->setValue(outHex);
+          authChar->notify();
+        }
+        delay(200);
+        return;
       }
-      delay(200);
-      //pBLEServer->disconnect(connId);
-      return;
+      email = lr.email;
+      password = lr.password;
+      deviceId = lr.deviceId;
+    } else {
+      // Parse email|password|deviceid
+      size_t sep1 = s.find('|');
+      size_t sep2 = (sep1 == std::string::npos) ? std::string::npos : s.find('|', sep1 + 1);
+      if (sep1 == std::string::npos || sep2 == std::string::npos) {
+        Serial.println("Auth: bad format — expected email|password|deviceid");
+        std::string outHex;
+        if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+          authChar->setValue(outHex);
+          authChar->notify();
+        }
+        delay(200);
+        //pBLEServer->disconnect(connId);
+        return;
+      }
+      email = s.substr(0, sep1);
+      password = s.substr(sep1 + 1, sep2 - (sep1 + 1));
+      deviceId = s.substr(sep2 + 1);
     }
-    std::string email = s.substr(0, sep1);
-    std::string password = s.substr(sep1 + 1, sep2 - (sep1 + 1));
-    std::string deviceId = s.substr(sep2 + 1);
     Serial.printf("Auth attempt — email: %s deviceId: %s\n", email.c_str(), deviceId.c_str());
 
     int userIdx = checkCredentials(email, password);
     bool okCreds = (userIdx >= 0);
+    // Meaningful only when !okCreds: the email is unknown, or it is known and
+    // the password is wrong.
+    CredentialFault credFault = okCreds ? CRED_BAD_PASSWORD : credentialFault(email);
     bool okTime = okCreds && isUserAccessAllowed(users[userIdx]);
     bool okDevice = (deviceId.length() > 0 && deviceId.length() <= 40 && isDeviceRegistered(deviceId.c_str()));
     // The role is read from this user's stored record, captured once here so
@@ -1608,8 +1663,16 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
     const char *okReply = okCreds ? authSuccessReply(users[userIdx]) : nullptr;
     bool okRole = (okReply != nullptr);
     bool ok = okCreds && okTime && okDevice && okRole;
+    // Why a refused login was refused (also the reason in the SD event log);
+    // nullptr when it was not refused.
+    const char *failReason = ok ? nullptr
+                           : !okCreds ? (credFault == CRED_BAD_PASSWORD ? "BAD_PASSWORD" : "BAD_EMAIL")
+                           : !okTime ? "OUT_OF_TIME"
+                           : !okDevice ? "UNTRUSTED_DEVICE"
+                           : "INVALID_ROLE";
     if (ok) {
       authenticated = true;
+      sessionJson = jsonReq;
       strncpy(connectedUserEmail, email.c_str(), sizeof(connectedUserEmail) - 1);
       connectedUserEmail[sizeof(connectedUserEmail) - 1] = '\0';
       Serial.printf("Authentication SUCCESS — user: %s device: %s (free heap: %u bytes)\n",
@@ -1627,7 +1690,8 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
       pendingLoginEvent  = true;
     } else {
       authenticated = false;
-      if (!okCreds) Serial.printf("Authentication FAILED (bad credentials) — user: %s\n", email.c_str());
+      if (!okCreds) Serial.printf("Authentication FAILED (%s) — user: %s\n",
+                                  credFault == CRED_BAD_PASSWORD ? "wrong password" : "unknown email", email.c_str());
       if (okCreds && !okTime) Serial.printf("Authentication FAILED (outside allowed access time) — user: %s\n", email.c_str());
       if (!okDevice) Serial.printf("Authentication FAILED (unregistered device) — device: %s\n", deviceId.c_str());
       if (okCreds && !okRole) Serial.printf("Authentication FAILED (stored role is not Admin or Operator) — user: %s\n", email.c_str());
@@ -1644,28 +1708,25 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
         }
         return o;
       };
-      const char *failReason = !okCreds ? "BAD_CREDENTIALS"
-                             : !okTime ? "OUT_OF_TIME"
-                             : !okDevice ? "UNTRUSTED_DEVICE"
-                             : "INVALID_ROLE";
       pendingLoginFailDetail = String(failReason) + " - email: " + cleanForLog(email) + ", device: " + cleanForLog(deviceId);
       pendingLoginFailEvent  = true;
     }
 
-    // Encrypt and send response
+    // Encrypt and send response, in the format of the request. Success carries
+    // the logged-in user's role, from the PLC's own record, and nothing else
+    // does:
+    //   JSON    {"v":1,"t":"login","ok":true,"role":"Admin"|"Operator"}
+    //           {"v":1,"t":"login","ok":false,"error":<code>}
+    //   legacy  "AUTH_OK" (Admin) | "AUTH_OK|Operator" | "AUTH_FAIL[:<code>]"
+    // <code> is the reason above (OUT_OF_TIME, UNTRUSTED_DEVICE, ...); a wrong
+    // email or password is named only while AUTH_REPLY_NAMES_BAD_CREDENTIAL is 1.
     std::string reply;
     if (ok) {
-      // Success reply carries the logged-in user's role, from the PLC's own
-      // record: exactly "AUTH_OK" (Admin) or "AUTH_OK|Operator" (Operator).
-      reply = okReply;
-    } else if (okCreds && !okTime) {
-      // Credentials valid but this timed user is outside their access window
-      reply = "AUTH_FAIL:OUT_OF_TIME";
-    } else if (okCreds && !okDevice) {
-      // Credentials valid but device not registered
-      reply = "AUTH_FAIL:UNTRUSTED_DEVICE";
+      // okRole is part of ok, so the stored role is exactly "Admin" or "Operator".
+      reply = jsonReq ? blep::loginOk(users[userIdx].role) : std::string(okReply);
     } else {
-      reply = "AUTH_FAIL";
+      const char *code = blep::loginErrorCode(failReason, AUTH_REPLY_NAMES_BAD_CREDENTIAL != 0);
+      reply = jsonReq ? blep::loginFail(code) : blep::loginFailLegacy(code);
     }
     std::string outHex;
     if (encryptAESGCM_packet(reply, outHex)) {
@@ -1748,7 +1809,7 @@ class DigitalCallbacks : public BLECharacteristicCallbacks {
     // Decrypt using AES-GCM (accepts hex text or raw bytes: IV(12) | CIPHER | TAG(16))
     uint8_t decrypted[128];
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, sizeof(decrypted), &decryptedLen)) {
       Serial.println("DECRYPT FAILED");
       return;
     }
@@ -1876,7 +1937,7 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
     uint64_t sessionId = 0;
     uint64_t counter = 0;
 
-    if (!decryptAndValidateEncryptedPayload(data, decrypted, &decryptedLen, sessionId, counter)) {
+    if (!decryptAndValidateEncryptedPayload(data, decrypted, sizeof(decrypted), &decryptedLen, sessionId, counter)) {
       Serial.println("Heartbeat decryption or validation failed");
       return;
     }
@@ -1933,6 +1994,7 @@ BLECharacteristic *userMgmtChar = nullptr;
 
 volatile bool pendingAddUserFlag = false;
 char          pendingAddReqId[12] = "";
+bool          pendingAddJson = false;     // the request was a JSON user.add: reply in JSON
 User          pendingAddUser;
 String        pendingAddBy;
 
@@ -1948,8 +2010,16 @@ static void sendUserMgmtReply(const std::string &plain) {
   Serial.printf("UserMgmt reply: %s\n", plain.c_str());
 }
 
-static void sendAddUserFail(const char *reqId, const char *reason) {
-  sendUserMgmtReply(std::string("ADD_USER_FAIL|") + reqId + "|" + reason);
+// Replies, in the format of the request: JSON {"v":1,"t":"user.add","id":..,
+// "ok":..,"error":..} or the legacy ADD_USER_OK|id / ADD_USER_FAIL|id|reason.
+static void sendAddUserFail(const char *reqId, const char *reason, bool json) {
+  sendUserMgmtReply(json ? blep::addUserFail((uint32_t)strtoul(reqId, nullptr, 10), reason)
+                         : std::string("ADD_USER_FAIL|") + reqId + "|" + reason);
+}
+
+static void sendAddUserOk(const char *reqId, bool json) {
+  sendUserMgmtReply(json ? blep::addUserOk((uint32_t)strtoul(reqId, nullptr, 10))
+                         : std::string("ADD_USER_OK|") + reqId);
 }
 
 // Splits on '|' keeping empty fields (the from/to fields may be empty).
@@ -1998,9 +2068,9 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    uint8_t decrypted[256];
+    uint8_t decrypted[320];   // a JSON user.add with every field at its maximum is ~260 bytes
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, sizeof(decrypted), &decryptedLen)) {
       Serial.println("UserMgmt: AES-GCM decryption failed");
       return;
     }
@@ -2010,11 +2080,37 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
     if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
     decrypted[decryptedLen] = '\0';
 
-    std::vector<std::string> f = splitPipe(reinterpret_cast<char*>(decrypted));
-    if (f.size() != 9 || f[0] != "ADD_USER") {
-      Serial.println("UserMgmt: bad format — expected 9 pipe-separated fields starting with ADD_USER");
-      sendAddUserFail("0", "BAD_FORMAT");
-      return;
+    // The request is a JSON user.add message (ble_protocol.h, v1) or the older
+    // ADD_USER|... line; either way it becomes the same nine fields below, and
+    // the reply is sent in the request's format.
+    const std::string plain = reinterpret_cast<char*>(decrypted);
+    const bool json = blep::isJson(plain);
+    std::vector<std::string> f;
+    if (json) {
+      blep::AddUserRequest req;
+      uint32_t replyId = 0;
+      blep::ParseError pe = blep::parseAddUser(plain, req, replyId);
+      if (pe != blep::ParseError::None) {
+        Serial.println("UserMgmt: bad format — expected a JSON user.add message");
+        sendAddUserFail(std::to_string(replyId).c_str(), pe == blep::ParseError::BadVersion ? "BAD_VERSION" : "BAD_FORMAT", true);
+        return;
+      }
+      f.push_back("ADD_USER");
+      f.push_back(req.id);
+      f.push_back(req.name);
+      f.push_back(req.email);
+      f.push_back(req.password);
+      f.push_back(req.role);
+      f.push_back(req.access);
+      f.push_back(req.from);
+      f.push_back(req.to);
+    } else {
+      f = splitPipe(plain);
+      if (f.size() != 9 || f[0] != "ADD_USER") {
+        Serial.println("UserMgmt: bad format — expected 9 pipe-separated fields starting with ADD_USER");
+        sendAddUserFail("0", "BAD_FORMAT", false);
+        return;
+      }
     }
 
     // reqId: 1-9 digits, echoed back in every reply
@@ -2022,7 +2118,7 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
     bool reqOk = !reqId.empty() && reqId.size() <= 9;
     for (unsigned char c : reqId) if (c < '0' || c > '9') reqOk = false;
     if (!reqOk) {
-      sendAddUserFail("0", "BAD_FORMAT");
+      sendAddUserFail("0", "BAD_FORMAT", json);
       return;
     }
     const char *rid = reqId.c_str();
@@ -2031,7 +2127,7 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
     int callerIdx = findUserIndexByEmail(connectedUserEmail);
     if (callerIdx < 0 || strcmp(users[callerIdx].role, "Admin") != 0) {
       Serial.printf("UserMgmt: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
-      sendAddUserFail(rid, "FORBIDDEN");
+      sendAddUserFail(rid, "FORBIDDEN", json);
       return;
     }
 
@@ -2040,15 +2136,15 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
         email.empty() || email.size() > 40 || email.find('@') == std::string::npos ||
         password.size() < 6 || password.size() > 32 ||
         !isCleanText(name) || !isCleanText(email) || !isCleanText(password)) {
-      sendAddUserFail(rid, "BAD_FORMAT");
+      sendAddUserFail(rid, "BAD_FORMAT", json);
       return;
     }
     if (role != "Operator" && role != "Admin") {
-      sendAddUserFail(rid, "BAD_ROLE");
+      sendAddUserFail(rid, "BAD_ROLE", json);
       return;
     }
     if (role == "Admin") {          // Admins can only create Operators
-      sendAddUserFail(rid, "FORBIDDEN");
+      sendAddUserFail(rid, "FORBIDDEN", json);
       return;
     }
 
@@ -2059,27 +2155,27 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
       uint32_t from = 0, to = 0;
       if (!parseDateTimeLocal(String(f[7].c_str()), from) ||
           !parseDateTimeLocal(String(f[8].c_str()), to) || to <= from) {
-        sendAddUserFail(rid, "BAD_ACCESS");
+        sendAddUserFail(rid, "BAD_ACCESS", json);
         return;
       }
       nu.accessType = ACCESS_TIMED;
       nu.startTs    = from;
       nu.endTs      = to;
     } else {
-      sendAddUserFail(rid, "BAD_ACCESS");
+      sendAddUserFail(rid, "BAD_ACCESS", json);
       return;
     }
 
     if (findUserIndexByEmail(email.c_str()) >= 0) {
-      sendAddUserFail(rid, "EMAIL_EXISTS");
+      sendAddUserFail(rid, "EMAIL_EXISTS", json);
       return;
     }
     if (userCount >= MAX_USERS) {
-      sendAddUserFail(rid, "MAX_USERS");
+      sendAddUserFail(rid, "MAX_USERS", json);
       return;
     }
     if (pendingAddUserFlag) {       // previous request still waiting for loop()
-      sendAddUserFail(rid, "BUSY");
+      sendAddUserFail(rid, "BUSY", json);
       return;
     }
 
@@ -2091,6 +2187,7 @@ class UserMgmtCallbacks : public BLECharacteristicCallbacks {
     strncpy(pendingAddReqId, rid, sizeof(pendingAddReqId) - 1);
     pendingAddReqId[sizeof(pendingAddReqId) - 1] = '\0';
     pendingAddBy = connectedUserEmail;
+    pendingAddJson = json;
     pendingAddUserFlag = true;      // set last: loop() starts processing now
     } catch (...) {
       // See AuthCallbacks::onWrite — same BLE-callback exception firewall.
@@ -2108,23 +2205,24 @@ static void processPendingAddUser() {
   reqId[sizeof(reqId) - 1] = '\0';
   User nu = pendingAddUser;
   String by = pendingAddBy;
+  const bool json = pendingAddJson;
 
   // The user list may have changed (web panel) since the request was queued.
   if (findUserIndexByEmail(nu.email) >= 0) {
-    sendAddUserFail(reqId, "EMAIL_EXISTS");
+    sendAddUserFail(reqId, "EMAIL_EXISTS", json);
   } else if (userCount >= MAX_USERS) {
-    sendAddUserFail(reqId, "MAX_USERS");
+    sendAddUserFail(reqId, "MAX_USERS", json);
   } else {
     users[userCount] = nu;
     userCount++;
     if (saveUsers()) {
       Serial.printf("UserMgmt: user added from app — %s (%s) by %s\n", nu.email, nu.role, by.c_str());
       logEvent("USER_ADDED", String(nu.name) + " (" + String(nu.email) + ") added as " + String(nu.role) + " by " + by);
-      sendUserMgmtReply(std::string("ADD_USER_OK|") + reqId);
+      sendAddUserOk(reqId, json);
     } else {
       userCount--;                  // roll back: could not be stored persistently
       memset(&users[userCount], 0, sizeof(User));
-      sendAddUserFail(reqId, "STORAGE_FAIL");
+      sendAddUserFail(reqId, "STORAGE_FAIL", json);
     }
   }
   pendingAddUserFlag = false;
@@ -2154,6 +2252,7 @@ static void processPendingAddUser() {
 #define LOG_LINE_MAX_CHARS        150
 #define LOG_MAX_LINES_PER_REQUEST 1000
 #define LOG_MIN_PEER_MTU          210   // 205-byte largest notification + 3 ATT header
+#define LOG_MIN_PEER_MTU_JSON     231   // JSON: 200-byte largest plaintext + 28 framing + 3 ATT header
 
 BLECharacteristic *logChar = nullptr;
 static SemaphoreHandle_t logTxMutex = nullptr;
@@ -2165,6 +2264,7 @@ volatile bool logReqPending = false;
 static LogJobType logReqType = LOGJOB_MONTHS;
 static String     logReqArg;
 static uint32_t   logReqFromSeq = 1;
+static bool       logReqJson = false;     // the request was JSON: answer in JSON
 
 // Job currently running (loop() only)
 static bool        logJobActive = false;
@@ -2176,6 +2276,7 @@ static uint32_t    logJobOffset = 0;      // byte position of the next unread li
 static uint32_t    logJobSeq = 0;         // last line number read
 static uint32_t    logJobFromSeq = 1;
 static uint32_t    logJobSent = 0;
+static bool        logJobJson = false;    // the running job answers in JSON
 
 static void sendLogPacket(const std::string &plain) {
   if (!logChar || !deviceConnected || !authenticated) return;
@@ -2190,8 +2291,10 @@ static void sendLogPacket(const std::string &plain) {
   if (logTxMutex) xSemaphoreGive(logTxMutex);
 }
 
-static void sendLogFail(const char *reason) {
-  sendLogPacket(std::string("LOG_FAIL|") + reason);
+// Failure reply, in the format of the request: {"v":1,"t":"log.fail","error":..}
+// or LOG_FAIL|reason.
+static void sendLogFail(const char *reason, bool json) {
+  sendLogPacket(json ? blep::logFail(reason) : std::string("LOG_FAIL|") + reason);
 }
 
 // SD.open() can throw std::bad_alloc under low heap (see logEvent()).
@@ -2216,7 +2319,7 @@ class LogCallbacks : public BLECharacteristicCallbacks {
     try {
     if (!authenticated) {
       Serial.println("EventLog rejected — not authenticated");
-      sendLogFail("NOT_AUTH");
+      sendLogFail("NOT_AUTH", false);
       return;
     }
 
@@ -2237,7 +2340,7 @@ class LogCallbacks : public BLECharacteristicCallbacks {
     }
     uint8_t decrypted[128];
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, sizeof(decrypted), &decryptedLen)) {
       Serial.println("EventLog: AES-GCM decryption failed");
       return;
     }
@@ -2246,51 +2349,82 @@ class LogCallbacks : public BLECharacteristicCallbacks {
     if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
     decrypted[decryptedLen] = '\0';
 
-    std::vector<std::string> f = splitPipe(reinterpret_cast<char*>(decrypted));
-    if (f.empty()) { sendLogFail("BAD_FORMAT"); return; }
-
-    LogJobType type;
-    if (f[0] == "LOG_MONTHS" && f.size() == 1)                          type = LOGJOB_MONTHS;
-    else if (f[0] == "LOG_DATES" && f.size() == 2)                      type = LOGJOB_DATES;
-    else if (f[0] == "LOG_DAY" && (f.size() == 2 || f.size() == 3))     type = LOGJOB_DAY;
-    else { sendLogFail("BAD_FORMAT"); return; }
+    // A JSON message (ble_protocol.h, v1: log.months / log.dates / log.day) or
+    // the older LOG_MONTHS / LOG_DATES|.. / LOG_DAY|.. line; the answer is sent
+    // in the same format.
+    const std::string plain = reinterpret_cast<char*>(decrypted);
+    const bool json = blep::isJson(plain);
+    std::vector<std::string> f;
+    blep::LogRequest jr;
+    LogJobType type = LOGJOB_MONTHS;
+    if (json) {
+      blep::ParseError pe = blep::parseLogRequest(plain, jr);
+      if (pe != blep::ParseError::None) {
+        sendLogFail(pe == blep::ParseError::BadVersion ? "BAD_VERSION" : "BAD_FORMAT", true);
+        return;
+      }
+      type = (jr.op == blep::LogOp::Months) ? LOGJOB_MONTHS
+           : (jr.op == blep::LogOp::Dates)  ? LOGJOB_DATES
+           :                                  LOGJOB_DAY;
+    } else {
+      f = splitPipe(plain);
+      if (f.empty()) { sendLogFail("BAD_FORMAT", false); return; }
+      if (f[0] == "LOG_MONTHS" && f.size() == 1)                          type = LOGJOB_MONTHS;
+      else if (f[0] == "LOG_DATES" && f.size() == 2)                      type = LOGJOB_DATES;
+      else if (f[0] == "LOG_DAY" && (f.size() == 2 || f.size() == 3))     type = LOGJOB_DAY;
+      else { sendLogFail("BAD_FORMAT", false); return; }
+    }
 
     // Only an Admin may read the event log.
     int callerIdx = findUserIndexByEmail(connectedUserEmail);
     if (callerIdx < 0 || strcmp(users[callerIdx].role, "Admin") != 0) {
       Serial.printf("EventLog: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
-      sendLogFail("FORBIDDEN");
+      sendLogFail("FORBIDDEN", json);
       return;
     }
 
     String arg = "";
     uint32_t fromSeq = 1;
-    if (type == LOGJOB_DATES) {
+    if (json) {
+      // Already shaped by blep::parseLogRequest (from is 1..9999999); the
+      // month / day text is still checked here, the only way a file is named.
+      if (type == LOGJOB_DATES) {
+        arg = jr.arg.c_str();
+        if (!validMonthStr(arg)) { sendLogFail("BAD_FORMAT", true); return; }
+      } else if (type == LOGJOB_DAY) {
+        arg = jr.arg.c_str();
+        if (!validDateStr(arg)) { sendLogFail("BAD_FORMAT", true); return; }
+        fromSeq = jr.from;
+      }
+    } else if (type == LOGJOB_DATES) {
       arg = f[1].c_str();
-      if (!validMonthStr(arg)) { sendLogFail("BAD_FORMAT"); return; }
+      if (!validMonthStr(arg)) { sendLogFail("BAD_FORMAT", false); return; }
     } else if (type == LOGJOB_DAY) {
       arg = f[1].c_str();
-      if (!validDateStr(arg)) { sendLogFail("BAD_FORMAT"); return; }
+      if (!validDateStr(arg)) { sendLogFail("BAD_FORMAT", false); return; }
       if (f.size() == 3) {
         const std::string &fs = f[2];
         bool fsOk = !fs.empty() && fs.size() <= 7;
         for (unsigned char c : fs) if (c < '0' || c > '9') fsOk = false;
         fromSeq = fsOk ? (uint32_t)strtoul(fs.c_str(), nullptr, 10) : 0;
-        if (!fsOk || fromSeq < 1) { sendLogFail("BAD_FORMAT"); return; }
+        if (!fsOk || fromSeq < 1) { sendLogFail("BAD_FORMAT", false); return; }
       }
     }
 
-    // Notifications are up to ~205 bytes; refuse early if the link can't carry them.
-    if (pBLEServer && pBLEServer->getPeerMTU(connId) < LOG_MIN_PEER_MTU) {
-      Serial.printf("EventLog: MTU too small (%u)\n", (unsigned)pBLEServer->getPeerMTU(connId));
-      sendLogFail("MTU_TOO_SMALL");
+    // Notifications are up to ~205 bytes (231 for JSON lines); refuse early if
+    // the link can't carry them.
+    const unsigned needMtu = json ? LOG_MIN_PEER_MTU_JSON : LOG_MIN_PEER_MTU;
+    if (pBLEServer && pBLEServer->getPeerMTU(connId) < needMtu) {
+      Serial.printf("EventLog: MTU too small (%u, need %u)\n", (unsigned)pBLEServer->getPeerMTU(connId), needMtu);
+      sendLogFail("MTU_TOO_SMALL", json);
       return;
     }
-    if (logReqPending || logJobActive) { sendLogFail("BUSY"); return; }
+    if (logReqPending || logJobActive) { sendLogFail("BUSY", json); return; }
 
     logReqType = type;
     logReqArg     = arg;
     logReqFromSeq = fromSeq;
+    logReqJson    = json;
     logReqPending = true;           // set last: loop() starts processing now
     } catch (...) {
       // See AuthCallbacks::onWrite — same BLE-callback exception firewall.
@@ -2311,6 +2445,7 @@ static bool startLogJob() {
   logJobType = logReqType;
   String arg = logReqArg;
   logJobFromSeq = logReqFromSeq;
+  logJobJson = logReqJson;
   logReqPending = false;
   logJobItems.clear();
   logJobIndex = 0;
@@ -2318,7 +2453,7 @@ static bool startLogJob() {
   try {
     if (logJobType == LOGJOB_MONTHS) {
       File root;
-      if (!openSd("/", root) || !root.isDirectory()) { sendLogFail("NO_SD"); return false; }
+      if (!openSd("/", root) || !root.isDirectory()) { sendLogFail("NO_SD", logJobJson); return false; }
       File e = root.openNextFile();
       while (e && logJobItems.size() < 60) {
         if (e.isDirectory()) {
@@ -2333,7 +2468,7 @@ static bool startLogJob() {
       std::sort(logJobItems.begin(), logJobItems.end());
     } else if (logJobType == LOGJOB_DATES) {
       File dir;
-      if (!openSd("/" + arg, dir) || !dir.isDirectory()) { sendLogFail("NO_DATA"); return false; }
+      if (!openSd("/" + arg, dir) || !dir.isDirectory()) { sendLogFail("NO_DATA", logJobJson); return false; }
       File e = dir.openNextFile();
       while (e && logJobItems.size() < 31) {
         if (!e.isDirectory()) {
@@ -2352,14 +2487,14 @@ static bool startLogJob() {
     } else {
       logJobPath = "/" + arg.substring(0, 7) + "/" + arg + ".log";
       File f;
-      if (!openSd(logJobPath, f) || f.isDirectory()) { sendLogFail("NO_DATA"); return false; }
+      if (!openSd(logJobPath, f) || f.isDirectory()) { sendLogFail("NO_DATA", logJobJson); return false; }
       f.close();
       logJobOffset = 0;
       logJobSeq    = 0;
       logJobSent   = 0;
     }
   } catch (...) {
-    sendLogFail("SD_FAIL");
+    sendLogFail("SD_FAIL", logJobJson);
     return false;
   }
   logJobActive = true;
@@ -2367,15 +2502,37 @@ static bool startLogJob() {
   return true;
 }
 
+// The ways a job closes its answer, in the job's format: LOG_END|count or
+// {"t":"log.end","count":n} for a listing, LOG_END|lastSeq|more or
+// {"t":"log.end","lastSeq":n,"more":b} for a day.
+static void sendLogEndCount(size_t count) {
+  sendLogPacket(logJobJson ? blep::logEnd((uint32_t)count)
+                           : std::string("LOG_END|") + std::to_string(count));
+}
+
+static void sendLogEndDay(bool more) {
+  sendLogPacket(logJobJson ? blep::logEndDay(logJobSeq, more)
+                           : std::string("LOG_END|") + std::to_string(logJobSeq) + "|" + (more ? "1" : "0"));
+}
+
 // Sends the next notification of the running job (at most one per call).
 static void stepLogJob() {
   if (logJobType == LOGJOB_MONTHS || logJobType == LOGJOB_DATES) {
     const char *tag = (logJobType == LOGJOB_MONTHS) ? "LOG_MONTH|" : "LOG_DATE|";
     if (logJobIndex < logJobItems.size()) {
-      sendLogPacket(std::string(tag) + logJobItems[logJobIndex].c_str());
+      const std::string item = logJobItems[logJobIndex].c_str();   // "YYYY-MM", or "YYYY-MM-DD|size"
+      if (!logJobJson) {
+        sendLogPacket(std::string(tag) + item);
+      } else if (logJobType == LOGJOB_MONTHS) {
+        sendLogPacket(blep::logMonth(item));
+      } else {
+        const size_t bar = item.find('|');
+        const uint32_t size = (bar == std::string::npos) ? 0 : (uint32_t)strtoul(item.c_str() + bar + 1, nullptr, 10);
+        sendLogPacket(blep::logDate(item.substr(0, bar), size));
+      }
       logJobIndex++;
     } else {
-      sendLogPacket(std::string("LOG_END|") + std::to_string(logJobItems.size()));
+      sendLogEndCount(logJobItems.size());
       endLogJob();
     }
     return;
@@ -2384,13 +2541,13 @@ static void stepLogJob() {
   // LOG_DAY: read one line from the stored byte offset and send it.
   File f;
   try {
-    if (!openSd(logJobPath, f)) { sendLogFail("SD_FAIL"); endLogJob(); return; }
-    if (logJobOffset > 0 && !f.seek(logJobOffset)) { f.close(); sendLogFail("SD_FAIL"); endLogJob(); return; }
+    if (!openSd(logJobPath, f)) { sendLogFail("SD_FAIL", logJobJson); endLogJob(); return; }
+    if (logJobOffset > 0 && !f.seek(logJobOffset)) { f.close(); sendLogFail("SD_FAIL", logJobJson); endLogJob(); return; }
 
     if (logJobSent >= LOG_MAX_LINES_PER_REQUEST) {   // per-request cap reached
       bool more = logJobOffset < (uint32_t)f.size();
       f.close();
-      sendLogPacket(std::string("LOG_END|") + std::to_string(logJobSeq) + "|" + (more ? "1" : "0"));
+      sendLogEndDay(more);
       endLogJob();
       return;
     }
@@ -2410,7 +2567,7 @@ static void stepLogJob() {
       }
       if (c < 0 && n == 0) {                          // end of file
         f.close();
-        sendLogPacket(std::string("LOG_END|") + std::to_string(logJobSeq) + "|0");
+        sendLogEndDay(false);
         endLogJob();
         return;
       }
@@ -2423,12 +2580,13 @@ static void stepLogJob() {
       }
       if (trunc && n >= 3) { line[n - 3] = '.'; line[n - 2] = '.'; line[n - 1] = '.'; }
       f.close();
-      sendLogPacket(std::string("LOG_LINE|") + std::to_string(logJobSeq) + "|" + std::string(line, n));
+      sendLogPacket(logJobJson ? blep::logLine(logJobSeq, std::string(line, n))
+                               : std::string("LOG_LINE|") + std::to_string(logJobSeq) + "|" + std::string(line, n));
       logJobSent++;
       return;
     }
   } catch (...) {
-    sendLogFail("SD_FAIL");
+    sendLogFail("SD_FAIL", logJobJson);
     endLogJob();
   }
 }
@@ -2708,7 +2866,7 @@ void loop() {
       if (ui >= 0 && !isUserAccessAllowed(users[ui])) {
         Serial.printf("Access window ended — disconnecting user: %s\n", connectedUserEmail);
         std::string outHex;
-        if (encryptAESGCM_packet("AUTH_FAIL:OUT_OF_TIME", outHex)) {
+        if (encryptAESGCM_packet(sessionJson ? blep::sessionEnd("OUT_OF_TIME") : std::string("AUTH_FAIL:OUT_OF_TIME"), outHex)) {
           authChar->setValue(outHex);
           authChar->notify();
         }
