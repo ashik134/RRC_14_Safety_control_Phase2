@@ -14,6 +14,7 @@
 #include "mbedtls/gcm.h"
 #include "web_handler.h"
 #include "ble_protocol.h"   // JSON wire format of the login / user-management / event-log characteristics
+#include "eth_diag.h"       // W5500 Ethernet hardware detect (additive, diagnostic only)
 #include "esp_gap_ble_api.h"
 #include "esp_log.h"
 #include "esp_bt.h"
@@ -2730,6 +2731,8 @@ void setup() {
     Serial.println("SD card ready for event logging");
   }
 
+  ethDiagInit();  // W5500 detect on the shared VSPI bus; after SD.begin(), diagnostic only
+
   loadUsers();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
   loadInputConfig();   // reads NVS, applies pinMode INPUT for all 9 inputs
@@ -2999,6 +3002,8 @@ void loop() {
       Serial.println("syncTimeCache: RTC not responding after 3 consecutive attempts — giving up on periodic resync for this session");
     }
   }
+
+  ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
 
   handleWiFi(); // does nothing in AP mode
   webServer.handleClient();
