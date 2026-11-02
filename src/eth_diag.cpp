@@ -4,6 +4,7 @@
 
 #include <SPI.h>
 #include <Ethernet.h>
+#include <Dns.h>
 
 // W5500 chip select on the 14IOS PLC (same value the Ethernet library
 // defaults to via PIN_SPI_SS_ETHERNET_LIB).
@@ -50,6 +51,31 @@ static const uint8_t PHYCFGR_DPX = 0x04;  // 1 = full duplex
 
 static const unsigned long POLL_INTERVAL_MS    = 1000;
 static const unsigned long SUMMARY_INTERVAL_MS = 30000;
+
+// Read-only TCP test server so a PC on the same switch can prove real
+// two-way traffic (in addition to ICMP ping, which the W5500 answers in
+// hardware once it has an IP). It never touches PLC I/O or safety state.
+// Unauthenticated by design: for bench/commissioning tests on an isolated
+// switch. Disable with -DETH_DIAG_TCP_PORT=0.
+#ifndef ETH_DIAG_TCP_PORT
+#define ETH_DIAG_TCP_PORT 5000
+#endif
+
+// Opt-in boot-time internet check (build with -DETH_DIAG_INTERNET_TEST=1).
+// Runs once from ethDiagInit(), i.e. before BLE/WiFi/crane logic start, with
+// hard time limits (worst case ~25 s extra boot time, ~8 s when no DHCP
+// server answers), so it can never stall the running safety loop. Off by
+// default because of that boot delay.
+#ifndef ETH_DIAG_INTERNET_TEST
+#define ETH_DIAG_INTERNET_TEST 0
+#endif
+static const char *netResult = "NOT_TESTED";   // reported by the TCP STATUS command
+
+#if ETH_DIAG_TCP_PORT
+static EthernetServer tcpServer(ETH_DIAG_TCP_PORT);
+static bool           tcpStarted  = false;
+static uint32_t       tcpRequests = 0;
+#endif
 
 static EthDiagStatus st = {false, 0x00, false, false, false};
 static uint8_t       ethMac[6];
@@ -111,6 +137,92 @@ static void w5500HardwareReset() {
   Serial.printf("[ETH] Hardware reset pulse on GPIO%d done\n", ETH_DIAG_RESET_PIN);
 #endif
 }
+
+#if ETH_DIAG_INTERNET_TEST
+// HEAD / over plain HTTP; success = a "HTTP/1.x <code>" status line came back.
+static bool httpHead(IPAddress ip, const char *host, char *statusLine, size_t statusLen) {
+  statusLine[0] = '\0';
+  EthernetClient c;
+  c.setConnectionTimeout(3000);
+  if (!c.connect(ip, 80)) {
+    Serial.printf("[NET]   TCP connect to %s:80 FAILED (no route / blocked)\n", ip.toString().c_str());
+    c.stop();
+    return false;
+  }
+  c.print("HEAD / HTTP/1.0\r\nHost: ");
+  c.print(host);
+  c.print("\r\nConnection: close\r\n\r\n");
+  unsigned long t0 = millis();
+  while (!c.available() && c.connected() && millis() - t0 < 4000) delay(10);
+  size_t n = 0;
+  while (c.available() && n < statusLen - 1) {
+    char ch = (char)c.read();
+    if (ch == '\r' || ch == '\n') break;
+    statusLine[n++] = ch;
+  }
+  statusLine[n] = '\0';
+  c.stop();
+  bool ok = strncmp(statusLine, "HTTP/", 5) == 0;
+  Serial.printf("[NET]   TCP to %s:80 connected, reply: '%s' -> %s\n",
+                ip.toString().c_str(), statusLine, ok ? "OK" : "NO HTTP REPLY");
+  return ok;
+}
+
+static void internetTest() {
+  Serial.println("[NET] ---- Internet access test (boot-time, time-limited) ----");
+
+  // The PHY needs a moment after reset to bring the link up.
+  for (int i = 0; i < 30 && !(readPhy(), st.linkUp); i++) delay(100);
+  if (!st.linkUp) {
+    Serial.println("[NET] Link is DOWN - cable/switch not connected. Test skipped.");
+    netResult = "NO_LINK";
+    return;
+  }
+
+  Serial.println("[NET] 1/4 DHCP: asking the network for an address, gateway and DNS...");
+  unsigned long t0 = millis();
+  bool dhcp = Ethernet.begin(ethMac, 8000, 2000) == 1;
+  if (dhcp) {
+    Serial.printf("[NET]   DHCP OK in %lu ms: ip=%s mask=%s gateway=%s dns=%s\n", millis() - t0,
+                  Ethernet.localIP().toString().c_str(), Ethernet.subnetMask().toString().c_str(),
+                  Ethernet.gatewayIP().toString().c_str(), Ethernet.dnsServerIP().toString().c_str());
+  } else {
+    // A failed lease leaves the chip at 0.0.0.0; restore the fixed address.
+    Serial.printf("[NET]   DHCP FAILED after %lu ms - no DHCP server on this network\n", millis() - t0);
+    Ethernet.begin(ethMac, IPAddress(ETH_DIAG_IP));
+    Serial.printf("[NET]   Using fixed %s, gateway guessed %s (no internet unless that is your router)\n",
+                  Ethernet.localIP().toString().c_str(), Ethernet.gatewayIP().toString().c_str());
+  }
+
+  char line[48];
+  Serial.println("[NET] 2/4 Reach the internet by IP (no DNS): Cloudflare 1.1.1.1");
+  bool byIp = httpHead(IPAddress(1, 1, 1, 1), "one.one.one.one", line, sizeof(line));
+
+  Serial.println("[NET] 3/4 DNS: resolving example.com");
+  DNSClient dns;
+  dns.begin(Ethernet.dnsServerIP());
+  IPAddress resolved;
+  bool dnsOk = dns.getHostByName("example.com", resolved, 3000) == 1;
+  if (dnsOk) Serial.printf("[NET]   example.com -> %s\n", resolved.toString().c_str());
+  else       Serial.println("[NET]   DNS lookup FAILED (no DNS server reachable / no internet)");
+
+  bool byName = false;
+  if (dnsOk) {
+    Serial.println("[NET] 4/4 HTTP request to example.com");
+    byName = httpHead(resolved, "example.com", line, sizeof(line));
+  } else {
+    Serial.println("[NET] 4/4 skipped (DNS failed)");
+  }
+
+  if (byIp && byName) netResult = "OK";
+  else if (byIp)      netResult = "OK_IP_ONLY_DNS_FAIL";
+  else                netResult = "FAIL";
+  Serial.printf("[NET] RESULT: internet %s  (dhcp=%s, by-IP=%s, dns=%s, by-name=%s)\n",
+                byIp ? "REACHABLE" : "NOT REACHABLE", dhcp ? "yes" : "no",
+                byIp ? "yes" : "no", dnsOk ? "yes" : "no", byName ? "yes" : "no");
+  Serial.println("[NET] ---------------------------------------------------------");
+}
+#endif
 
 void ethDiagInit() {
   Serial.println();
@@ -224,11 +336,62 @@ void ethDiagInit() {
   if (st.chipDetected) {
     Serial.printf("[ETH] Static IP %s\n", Ethernet.localIP().toString().c_str());
     printLink();
+#if ETH_DIAG_INTERNET_TEST
+    internetTest();
+#endif
+#if ETH_DIAG_TCP_PORT
+    // Bound the worst-case time a send to a vanished peer can block loop().
+    Ethernet.setRetransmissionTimeout(100);
+    Ethernet.setRetransmissionCount(3);
+    tcpServer.begin();
+    tcpStarted = true;
+    Serial.printf("[ETH] Test server listening on %s:%u (TCP: PING, STATUS, HELP; ICMP ping also answered)\n",
+                  Ethernet.localIP().toString().c_str(), (unsigned)ETH_DIAG_TCP_PORT);
+#endif
   }
   Serial.println("[ETH] ----------------------------------------");
 }
 
+#if ETH_DIAG_TCP_PORT
+// One short command per packet, e.g. from `nc`/telnet/PowerShell. Non-blocking
+// apart from the tiny reply write; handles at most one request per call.
+static void serveTcp() {
+  if (!tcpStarted) return;
+  EthernetClient c = tcpServer.available();
+  if (!c) return;
+
+  char buf[48];
+  int n = c.read((uint8_t *)buf, sizeof(buf) - 1);
+  if (n <= 0) return;
+  while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) n--;
+  buf[n] = '\0';
+  for (int i = 0; i < n; i++) buf[i] = toupper((unsigned char)buf[i]);
+
+  tcpRequests++;
+  Serial.printf("[ETH] TCP request #%lu from %s: '%s'\n",
+                (unsigned long)tcpRequests, c.remoteIP().toString().c_str(), buf);
+
+  if (strcmp(buf, "PING") == 0) {
+    c.print("PONG\r\n");
+  } else if (strcmp(buf, "STATUS") == 0) {
+    c.printf("OK uptime_s=%lu link=%s speed=%s duplex=%s ip=%s internet=%s free_heap=%u requests=%lu\r\n",
+             millis() / 1000UL, st.linkUp ? "UP" : "DOWN",
+             st.speed100 ? "100" : "10", st.fullDuplex ? "full" : "half",
+             Ethernet.localIP().toString().c_str(), netResult,
+             (unsigned)ESP.getFreeHeap(), (unsigned long)tcpRequests);
+  } else if (strcmp(buf, "HELP") == 0) {
+    c.print("Commands: PING, STATUS, HELP (read-only)\r\n");
+  } else {
+    c.print("ERR unknown command. Commands: PING, STATUS, HELP\r\n");
+  }
+}
+#endif
+
 void ethDiagPoll() {
+#if ETH_DIAG_TCP_PORT
+  serveTcp();   // every loop() so replies are prompt; cheap when idle
+#endif
+
   static unsigned long lastPollMs    = 0;
   static unsigned long lastSummaryMs = 0;
   static bool          lastLink      = false;
