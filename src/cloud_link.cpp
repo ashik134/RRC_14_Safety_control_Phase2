@@ -14,8 +14,15 @@
 #include "eth_diag.h"
 #include "web_handler.h"   // FIRMWARE_VERSION
 
-#ifndef CLOUD_PROJECT_ID
-#define CLOUD_PROJECT_ID "web-app-intelliguard"
+// The Firebase project is chosen at build time, in platformio.ini build_flags:
+//   -DCLOUD_PROJECT_ID=\"your-project-id\"
+// There is no default: a build without it never connects to any project.
+#ifdef CLOUD_PROJECT_ID
+static const char *PROJECT_ID  = CLOUD_PROJECT_ID;
+static const char *COMMIT_PATH = "/v1/projects/" CLOUD_PROJECT_ID "/databases/(default)/documents:commit";
+#else
+static const char *PROJECT_ID  = nullptr;
+static const char *COMMIT_PATH = nullptr;
 #endif
 
 // The web app shows Offline after 90 s of silence, so a failed heartbeat is
@@ -262,14 +269,13 @@ static bool sendHeartbeat() {
   strlcpy(s.ip, Ethernet.localIP().toString().c_str(), sizeof(s.ip));
   s.uptimeS = (uint32_t)(esp_timer_get_time() / 1000000LL);
 
-  if (cloudBuildHeartbeat(mem->body, sizeof(mem->body), CLOUD_PROJECT_ID, creds.plcId, FIRMWARE_VERSION, s) == 0) {
+  if (cloudBuildHeartbeat(mem->body, sizeof(mem->body), PROJECT_ID, creds.plcId, FIRMWARE_VERSION, s) == 0) {
     setState("Heartbeat too long to send");
     return false;
   }
 
   const char *stage = "";
-  int status = httpsPost(FIRESTORE_HOST, "/v1/projects/" CLOUD_PROJECT_ID "/databases/(default)/documents:commit",
-                         mem->token, mem->body, stage);
+  int status = httpsPost(FIRESTORE_HOST, COMMIT_PATH, mem->token, mem->body, stage);
   if (status == 200) return true;
   if (status == 0) {
     setState("Heartbeat failed at: %s", stage);
@@ -428,6 +434,11 @@ static volatile bool taskRunning = false;
 // and Wi-Fi stacks preempt it, and loop() on core 1 is never blocked by it.
 static void startTask() {
   if (taskRunning) return;
+  if (!PROJECT_ID) {
+    // Leaves the W5500 with loop(), as on an unconfigured PLC.
+    setState("No cloud project set in this build");
+    return;
+  }
   // Set first: loop() must stop using the W5500 before the task starts on it.
   // This always runs on loop()'s own task, so loop() is not mid-poll here.
   taskRunning = true;
@@ -438,6 +449,8 @@ static void startTask() {
 }
 
 bool cloudLinkRunning() { return taskRunning; }
+
+bool cloudLinkAvailable() { return PROJECT_ID != nullptr; }
 
 void cloudLinkBegin() {
   loadCreds();

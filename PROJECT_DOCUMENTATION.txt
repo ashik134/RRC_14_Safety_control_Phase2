@@ -832,6 +832,11 @@ Main features
  clamped to valid ranges at load time. The partition table keeps the NVS
  offset/size unchanged so settings survive firmware updates.
 
+ Cloud Link is DISABLED in the current build: no Firebase project is set, so
+ nothing is sent anywhere and the Cloud Link page is hidden from the web panel.
+ To enable it, add -DCLOUD_PROJECT_ID=\"<firebase-project-id>\" to build_flags
+ in platformio.ini. The description below applies once it is enabled.
+
  Cloud Link (cloud_link.cpp): every 60 s a low-priority task on core 0 reports
  status to the IntelliKran cloud over the W5500 Ethernet port, which is how the
  web app knows this PLC is online. It is one-way and touches no outputs, and

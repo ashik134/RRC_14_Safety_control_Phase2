@@ -57,7 +57,7 @@ struct Target {
 };
 
 static const Target TARGETS[] = {
-  {"firestore.googleapis.com", "/v1/projects/web-app-intelliguard/databases/(default)/documents/plcs/tls-spike"},
+  {"firestore.googleapis.com", "/"},
   {"identitytoolkit.googleapis.com", "/"},
   {"securetoken.googleapis.com", "/"},
 };

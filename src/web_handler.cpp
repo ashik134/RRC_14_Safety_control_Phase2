@@ -856,7 +856,8 @@ static String sidebarHtml(const String &role, const String &active)
   {
     h += "<div class='nav-title'>System</div>";
     h += navItem("ota", "cloud", "Firmware Update", active);
-    h += navItem("cloud", "wifi", "Cloud Link", active);
+    if (cloudLinkAvailable())
+      h += navItem("cloud", "wifi", "Cloud Link", active);
     h += navItem("files", "folder", "Files", active);
   }
   h += "</nav><div class='side-foot'><b>IntelliControl</b>" FIRMWARE_VERSION "</div></aside>";
@@ -1529,7 +1530,7 @@ static void handleRoot()
     activeTab = "home";
   if (!isAdmin && activeTab == "files")
     activeTab = "home";
-  if (!isAdmin && activeTab == "cloud")
+  if ((!isAdmin || !cloudLinkAvailable()) && activeTab == "cloud")
     activeTab = "home";
   if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "devices" && activeTab != "inconfig" && activeTab != "time" && activeTab != "ota" && activeTab != "files" && activeTab != "cloud")
     activeTab = defaultTab;
@@ -2403,6 +2404,11 @@ static void handleCloudPost()
 {
   if (!webAuthAdmin())
     return;
+  if (!cloudLinkAvailable())
+  {
+    sendSafe(404, "text/html", errorPage("Cloud Link is not enabled in this firmware.", "/"));
+    return;
+  }
   String plcId = webServer.arg("plcId");
   String login = webServer.arg("login");
   String key = webServer.arg("key");

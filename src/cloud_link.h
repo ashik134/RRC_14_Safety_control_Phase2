@@ -29,6 +29,9 @@ void cloudLinkBegin();                               // once, at the end of setu
 void cloudLinkPublish(const CloudStatus &status);    // from loop(); cheap, never blocks
 void cloudLinkGetInfo(CloudLinkInfo &info);
 bool cloudLinkRunning();                             // true = the task owns the W5500
+// False when the build sets no CLOUD_PROJECT_ID: nothing is ever sent, and the
+// local web panel hides the Cloud Link page.
+bool cloudLinkAvailable();
 
 // The caller validates the values, and must be on loop()'s task (the web server
 // is): saving can hand the W5500 over. Returns false if they could not be stored.
