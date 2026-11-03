@@ -2,6 +2,7 @@
 #include <Update.h>
 #include <SD.h>
 #include "web_logo.h"
+#include "cloud_link.h"
 
 // Drop-in replacement for webServer.send(...), used everywhere in this file
 // instead of calling it directly.
@@ -855,6 +856,7 @@ static String sidebarHtml(const String &role, const String &active)
   {
     h += "<div class='nav-title'>System</div>";
     h += navItem("ota", "cloud", "Firmware Update", active);
+    h += navItem("cloud", "wifi", "Cloud Link", active);
     h += navItem("files", "folder", "Files", active);
   }
   h += "</nav><div class='side-foot'><b>IntelliControl</b>" FIRMWARE_VERSION "</div></aside>";
@@ -1454,6 +1456,8 @@ static String filesTabUrl(const String &name)
 // open must degrade to "can't open", never abort the controller.
 static bool sdOpen(const String &path, const char *mode, File &f)
 {
+  if (!sdOk) // a dead card costs loop() ~1.5 s per attempt: see logEvent()
+    return false;
   try
   {
     f = SD.open(path, mode);
@@ -1462,6 +1466,8 @@ static bool sdOpen(const String &path, const char *mode, File &f)
   {
     return false;
   }
+  if (!f)
+    sdCheckAfterFailedOpen();
   return (bool)f;
 }
 
@@ -1523,7 +1529,9 @@ static void handleRoot()
     activeTab = "home";
   if (!isAdmin && activeTab == "files")
     activeTab = "home";
-  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "devices" && activeTab != "inconfig" && activeTab != "time" && activeTab != "ota" && activeTab != "files")
+  if (!isAdmin && activeTab == "cloud")
+    activeTab = "home";
+  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "devices" && activeTab != "inconfig" && activeTab != "time" && activeTab != "ota" && activeTab != "files" && activeTab != "cloud")
     activeTab = defaultTab;
   bool isHome = (activeTab == "home");
   bool isUsers = (activeTab == "users");
@@ -1534,6 +1542,7 @@ static void handleRoot()
   bool isTime = (activeTab == "time");
   bool isOta = (activeTab == "ota");
   bool isFiles = (activeTab == "files");
+  bool isCloud = (activeTab == "cloud");
 
   // fragMode: an AJAX tab-switch request (see showTab() in the page shell
   // script below) asking only for the active tab's own markup, not the
@@ -1876,6 +1885,42 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
 })();
 </script>)JS";
     html += "</div>"; // end tab-ota
+  }
+  mayFlush();
+
+  // ====== CLOUD LINK PANEL ======
+  if (isAdmin && isCloud)
+  {
+    CloudLinkInfo cloud;
+    cloudLinkGetInfo(cloud);
+    html += "<div id='tab-cloud' class='page page-narrow'>";
+    html += panelHead("wifi", "Cloud Link", "Reports this PLC's status to the IntelliKran web app over the Ethernet port. Crane control does not depend on it.");
+    if (webServer.hasArg("saved"))
+      html += alertHtml("success", "Saved. The PLC will try to connect within a few seconds.");
+    html += "<div class='card'><dl class='kv'>";
+    html += kvItem("Status", htmlEsc(String(cloud.state)));
+    html += kvItem("PLC ID", cloud.configured ? htmlEsc(String(cloud.plcId)) : String("&mdash;"));
+    html += kvItem("Device login", cloud.configured ? htmlEsc(String(cloud.login)) : String("&mdash;"));
+    html += kvItem("Last report", cloud.everOk ? String((unsigned long)cloud.lastOkAgoS) + " s ago" : String("None since boot"));
+    html += kvItem("Reports sent / failed", String((unsigned long)cloud.okCount) + " / " + String((unsigned long)cloud.failCount));
+    html += "</dl></div>";
+    html += "<div class='card'>";
+    html += "<form method='POST' action='/cloud'>";
+    html += "<div class='form-group'><label for='cl-plc'>PLC ID</label><input id='cl-plc' name='plcId' maxlength='32' autocomplete='off' required></div>";
+    html += "<div class='form-group'><label for='cl-login'>Device login</label><input id='cl-login' name='login' maxlength='96' autocomplete='off' required></div>";
+    html += "<div class='form-group'><label for='cl-key'>Device key</label><input id='cl-key' name='key' type='password' maxlength='64' autocomplete='off' required></div>";
+    html += "<div class='form-group'><label for='cl-api'>Web API key</label><input id='cl-api' name='apiKey' maxlength='64' autocomplete='off' required></div>";
+    html += alertHtml("info", "Copy these from PLC Fleet in the web app when the PLC is registered, or after choosing New key. The device key cannot be read back from this page.");
+    html += "<div class='form-actions'><button type='submit' class='btn btn-primary'>Save</button></div>";
+    html += "</form>";
+    if (cloud.configured)
+    {
+      html += "<form method='POST' action='/cloud/clear'><div class='form-actions'>";
+      html += "<button type='submit' class='btn btn-outline'>Remove login and stop reporting</button>";
+      html += "</div></form>";
+    }
+    html += "</div>"; // end card
+    html += "</div>"; // end tab-cloud
   }
   mayFlush();
 
@@ -2348,6 +2393,54 @@ static void handleDevicesPost()
   deviceCount++;
   saveDevices();
   webServer.sendHeader("Location", "/?tab=devices");
+  sendSafe(303);
+}
+
+// ============================================================
+//  Cloud Link POST — store the device login (Admin only)
+// ============================================================
+static void handleCloudPost()
+{
+  if (!webAuthAdmin())
+    return;
+  String plcId = webServer.arg("plcId");
+  String login = webServer.arg("login");
+  String key = webServer.arg("key");
+  String apiKey = webServer.arg("apiKey");
+  plcId.trim();
+  login.trim();
+  key.trim();
+  apiKey.trim();
+  if (!cloudValidPlcId(plcId.c_str()))
+  {
+    sendSafe(400, "text/html", errorPage("PLC ID must be 3-32 lower-case letters, digits or hyphens.", "/?tab=cloud"));
+    return;
+  }
+  if (login.length() == 0 || login.length() > 96 || key.length() == 0 || key.length() > 64)
+  {
+    sendSafe(400, "text/html", errorPage("Device login and device key are required.", "/?tab=cloud"));
+    return;
+  }
+  if (!cloudValidApiKey(apiKey.c_str()))
+  {
+    sendSafe(400, "text/html", errorPage("Web API key is not valid.", "/?tab=cloud"));
+    return;
+  }
+  if (!cloudLinkSave(plcId, login, key, apiKey))
+  {
+    sendSafe(500, "text/html", errorPage("Could not save to device storage.", "/?tab=cloud"));
+    return;
+  }
+  webServer.sendHeader("Location", "/?tab=cloud&saved=1");
+  sendSafe(303);
+}
+
+static void handleCloudClearPost()
+{
+  if (!webAuthAdmin())
+    return;
+  cloudLinkClear();
+  webServer.sendHeader("Location", "/?tab=cloud");
   sendSafe(303);
 }
 
@@ -3379,6 +3472,8 @@ void setupWebRoutes()
   webServer.on("/timeconfig", HTTP_POST, handleTimeConfigPost);
   webServer.on("/devices", HTTP_POST, handleDevicesPost);
   webServer.on("/devices/delete", HTTP_POST, handleDeleteDevicePost);
+  webServer.on("/cloud", HTTP_POST, handleCloudPost);
+  webServer.on("/cloud/clear", HTTP_POST, handleCloudClearPost);
   webServer.on("/ota", HTTP_POST, handleOtaComplete, handleOtaUpload);
   webServer.on("/files/download", HTTP_GET, handleFileDownload);
   webServer.on("/files/edit", HTTP_GET, handleFileEditGet);

@@ -142,6 +142,7 @@ uint8_t getMotionIdForLabel(const char* label);
 // RTC + SD event logging — defined in main.cpp
 extern bool rtcOk;
 extern bool sdOk;
+void sdCheckAfterFailedOpen();   // defined in main.cpp
 bool validMonthStr(const String& s); // "YYYY-MM"
 bool validDateStr(const String& s);  // "YYYY-MM-DD"
 String currentTimestamp(); // "YYYY-MM-DD HH:MM:SS", or "N/A" if RTC unavailable

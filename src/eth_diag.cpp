@@ -24,13 +24,12 @@ static uint8_t ETH_CS_PIN = 14;
 #define ETH_DIAG_SWEEP 0
 #endif
 
-// On this PLC the W5500 stays silent after power-up/reset until GPIO4 is
-// driven (found by the sweep: it starts answering right after GPIO4 is
-// toggled). GPIO4 is therefore treated as the W5500 reset/enable line: pulsed
-// low then held high before the first SPI access. The vendor Ethernet library
-// has no reset-pin support, so this is done here. -1 disables it.
+// No reset line by default. GPIO4, which the sweep found the W5500 depends on,
+// is not a reset: it switches the bus between the SD card and the W5500, and
+// spi_bus_switch.cpp handles it on every transaction. Set a pin here to pulse
+// one low then high before the first SPI access.
 #ifndef ETH_DIAG_RESET_PIN
-#define ETH_DIAG_RESET_PIN 4
+#define ETH_DIAG_RESET_PIN -1
 #endif
 
 // Static address: DHCP would block for up to a minute with no cable, which
@@ -132,8 +131,9 @@ static void w5500HardwareReset() {
   pinMode(ETH_DIAG_RESET_PIN, OUTPUT);
   digitalWrite(ETH_DIAG_RESET_PIN, LOW);
   delay(20);
-  digitalWrite(ETH_DIAG_RESET_PIN, HIGH);   // left driven high: chip out of reset
+  digitalWrite(ETH_DIAG_RESET_PIN, HIGH);
   delay(150);
+  pinMode(ETH_DIAG_RESET_PIN, INPUT);
   Serial.printf("[ETH] Hardware reset pulse on GPIO%d done\n", ETH_DIAG_RESET_PIN);
 #endif
 }
@@ -434,12 +434,30 @@ void ethDiagPoll() {
   }
 }
 
+// The chip is not reset by this (W5100.init() only runs once), so the test
+// server's listening socket survives and must not be opened a second time.
+bool ethDiagStartDhcp() {
+  // Only the cloud task calls this, so nothing here can hold up loop() and the
+  // W5500 defaults, which suit an internet path, can come back.
+  Ethernet.setRetransmissionTimeout(200);
+  Ethernet.setRetransmissionCount(8);
+  bool dhcp = Ethernet.begin(ethMac, 8000, 2000) == 1;
+  if (dhcp) {
+    Serial.printf("[ETH] DHCP OK: ip=%s gateway=%s dns=%s\n", Ethernet.localIP().toString().c_str(),
+                  Ethernet.gatewayIP().toString().c_str(), Ethernet.dnsServerIP().toString().c_str());
+  } else {
+    Ethernet.begin(ethMac, IPAddress(ETH_DIAG_IP));   // a failed lease leaves the chip at 0.0.0.0
+  }
+  return dhcp;
+}
+
 EthDiagStatus ethDiagGetStatus() { return st; }
 
 #else  // ETH_DIAG_ENABLED == 0
 
 void ethDiagInit() {}
 void ethDiagPoll() {}
+bool ethDiagStartDhcp() { return false; }
 EthDiagStatus ethDiagGetStatus() { return EthDiagStatus{false, 0, false, false, false}; }
 
 #endif

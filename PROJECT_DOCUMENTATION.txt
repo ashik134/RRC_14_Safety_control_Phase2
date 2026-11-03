@@ -119,6 +119,11 @@ Main features
 
  SD card
    microSD slot, chip-select GPIO 5 (VSPI SS). Optional.
+   It shares VSPI with the W5500 (chip-select GPIO 14) through a switch on
+   GPIO 4: LOW = SD card, HIGH = W5500. Only one is reachable at a time, and
+   neither loses state across a switch. src/spi_bus_switch.cpp moves it on every
+   SPI transaction, so nothing else may drive GPIO 4 or use another bus clock
+   for the SD card (it picks the side from the clock: 4 MHz / 400 kHz = SD).
 
  Radio
    - Wi-Fi in Access-Point mode (no station mode).
@@ -138,7 +143,7 @@ Main features
  Tasks / contexts
    - Arduino loop() task : safety loop, web server handleClient(), SD logging,
                            RTC resync.
-   - BLE (Bluedroid) task: runs the GATT callbacks (onConnect, onDisconnect,
+   - BLE (NimBLE host) task: runs the GATT callbacks (onConnect, onDisconnect,
                            AuthCallbacks, DigitalCallbacks, HeartbeatCallbacks).
    - Wi-Fi / lwIP tasks  : handled by the SDK.
 
@@ -770,6 +775,10 @@ Main features
 ================================================================================
 17. SD CARD EVENT LOGGING
 ================================================================================
+ If the card stops responding, event logging turns off until the next restart:
+ each attempt on a dead card blocks loop() for about 1.5 s. Boot prints whether
+ the card and the RTC still answer after Ethernet init.
+
  Optional - if the card is missing, events are only printed on Serial.
  Files   : one folder per month, one file per day:
                /YYYY-MM/YYYY-MM-DD.log     e.g. /2026-11/2026-11-02.log
@@ -817,10 +826,21 @@ Main features
  netconfig    wifi_ssid, wifi_password, ble_name     Network names
  devices      count, dev_i, owner_i                  Device registry
  webadmin     user, pass                             Web admin credentials
+ cloudlink    plc, login, key, api                   Cloud device login
 
  Defaults are applied when keys are missing/invalid, and values are
  clamped to valid ranges at load time. The partition table keeps the NVS
  offset/size unchanged so settings survive firmware updates.
+
+ Cloud Link (cloud_link.cpp): every 60 s a low-priority task on core 0 reports
+ status to the IntelliKran cloud over the W5500 Ethernet port, which is how the
+ web app knows this PLC is online. It is one-way and touches no outputs, and
+ loop() only hands it a snapshot once a second. The address comes from DHCP.
+ The task starts when a login is entered under Cloud Link in the web panel
+ (Admin), and then owns the W5500, so ethDiagPoll() moves there from loop().
+ Each report needs about 50 KB of heap and starts only with 68 KB free. With
+ Bluedroid BLE only about 45 KB was free at boot, which is why the firmware
+ moved to NimBLE. If memory is short the panel shows "Waiting for free memory".
 
 
 ================================================================================

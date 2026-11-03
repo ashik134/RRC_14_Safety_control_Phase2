@@ -1,9 +1,6 @@
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -15,9 +12,9 @@
 #include "web_handler.h"
 #include "ble_protocol.h"   // JSON wire format of the login / user-management / event-log characteristics
 #include "eth_diag.h"       // W5500 Ethernet hardware detect (additive, diagnostic only)
-#include "esp_gap_ble_api.h"
+#include "cloud_link.h"     // Cloud heartbeat over Ethernet, in its own task
+#include "spi_bus_switch.h" // GPIO4 picks the SD card or the W5500 on the shared bus
 #include "esp_log.h"
-#include "esp_bt.h"
 #include <time.h>
 #include <vector>
 #include <string>
@@ -28,13 +25,11 @@
 #define AUTH_CHAR_UUID      "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
 #define STATUS_CHAR_UUID    "6e400005-b5a3-f393-e0a9-e50e24dcca9e"
 #define HEARTBEAT_CHAR_UUID "6e400006-b5a3-f393-e0a9-e50e24dcca9e"
-#define BLE_SERVICE_HANDLE_COUNT 24
 
 // Second GATT service: user management from the mobile app (ADD_USER command)
 #define USERMGMT_SERVICE_UUID "6e400010-b5a3-f393-e0a9-e50e24dcca9e"
 #define USERMGMT_CHAR_UUID    "6e400011-b5a3-f393-e0a9-e50e24dcca9e"
 #define LOG_CHAR_UUID         "6e400012-b5a3-f393-e0a9-e50e24dcca9e"
-#define BLE_USERMGMT_HANDLE_COUNT 12
 
 #define AUTH_TIMEOUT_MS  60000
 
@@ -353,9 +348,31 @@ bool validDateStr(const String &s) {
 // Opens, writes and closes the file immediately on every call so an entry
 // is never lost to a power cut, and so a card that was reinserted after a
 // failure is picked back up on the very next call (no persistent flag).
+// A failed open may only mean the file is not there, so this asks the card
+// itself: if even the root cannot be opened, the card has stopped responding
+// and SD use ends here until a restart (see logEvent() for why).
+void sdCheckAfterFailedOpen() {
+  try {
+    File root = SD.open("/");
+    if (root) {
+      root.close();
+      return;
+    }
+  } catch (...) {
+    return;   // out of memory says nothing about the card
+  }
+  Serial.println("SD card not responding — SD use off until restart");
+  sdOk = false;
+}
+
 void logEvent(const char* category, const String& detail) {
   String ts = currentTimestamp();
   Serial.printf("[EVENT] %s: %s | %s\n", ts.c_str(), category, detail.c_str());
+
+  // Every call to a card that has stopped answering costs ~1.5 s of retries
+  // inside the SD driver, and this runs on loop(): that long without sampling
+  // the interlock. So the first failure turns logging off until a restart.
+  if (!sdOk) return;
 
   // SD.open() allocates a C++ object (make_shared<VFSFileImpl>) internally,
   // which throws std::bad_alloc if heap is too low/fragmented at the
@@ -381,7 +398,8 @@ void logEvent(const char* category, const String& detail) {
       if (SD.exists(dirPath) || SD.mkdir(dirPath)) {
         knownDir = dirPath;
       } else {
-        Serial.println("logEvent: could not create month folder — entry not persisted");
+        Serial.println("logEvent: SD card not responding — event logging off until restart");
+        sdOk = false;
         return;
       }
     }
@@ -393,7 +411,8 @@ void logEvent(const char* category, const String& detail) {
     return;
   }
   if (!f) {
-    Serial.println("logEvent: SD card unavailable — entry not persisted");
+    Serial.println("logEvent: SD card not responding — event logging off until restart");
+    sdOk = false;
     return;
   }
   f.print(ts);
@@ -411,18 +430,6 @@ static const uint8_t aesKey[16] = {
   0x52, 0x43, 0x5F, 0x44,
   0x45, 0x56, 0x5F, 0x31
 };
-
-void updateConnectionParams()
-{
-  esp_ble_conn_update_params_t params;
-
-  params.min_int = 0x06;
-  params.max_int = 0x06;
-  params.latency = 0;
-  params.timeout = 400;
-
-  esp_ble_gap_update_conn_params(&params);
-}
 
 // AES-GCM decryption helper — accepts either hex text or raw bytes
 // [decryptedCapacity] is the size of [decrypted]. GCM writes the plaintext before
@@ -837,11 +844,11 @@ bool          wifiConnected  = false;
 unsigned long wifiRetryTime  = 0;
 
 // BLE
-BLEServer         *pBLEServer    = nullptr;
-BLECharacteristic *digitalChar   = nullptr;
-BLECharacteristic *authChar      = nullptr;
-BLECharacteristic *statusChar    = nullptr;
-BLECharacteristic *heartbeatChar = nullptr;
+NimBLEServer         *pBLEServer    = nullptr;
+NimBLECharacteristic *digitalChar   = nullptr;
+NimBLECharacteristic *authChar      = nullptr;
+NimBLECharacteristic *statusChar    = nullptr;
+NimBLECharacteristic *heartbeatChar = nullptr;
 
 bool     deviceConnected  = false;
 bool     authenticated    = false;
@@ -1461,14 +1468,12 @@ void handleWiFi() {
 }
 
 // ---------------- SERVER CALLBACK ----------------
-class MyServerCallbacks : public BLEServerCallbacks {
-  // Extended onConnect gives us the connection handle
-  void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
+class MyServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo &connInfo) override {
     deviceConnected = true;
-    updateConnectionParams();
     authenticated   = false;
     sessionJson     = false;
-    connId          = param->connect.conn_id;
+    connId          = connInfo.getConnHandle();
     connectTime     = millis();
     Serial.printf("Mobile connected — waiting for credentials (free heap: %u bytes)\n",
                   (unsigned)ESP.getFreeHeap());
@@ -1480,7 +1485,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     authChar->notify();
   }
 
-  void onDisconnect(BLEServer* pServer) {
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo &connInfo, int reason) override {
     // Log the logout before clearing session state, and only if this
     // connection actually completed a login — an unauthenticated device
     // dropping mid-handshake never logged in, so it has nothing to log out.
@@ -1501,7 +1506,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     sessionJson     = false;
     connectedUserEmail[0] = '\0';
     logJobCancel    = true;
-    Serial.println("Mobile disconnected");
+    Serial.printf("Mobile disconnected (reason 0x%02X)\n", reason);
 
     // No command source for directional motion — stop it. E-STOP is also
     // tripped on disconnect now, the same as a physical I0.1 trip: latch
@@ -1520,12 +1525,12 @@ class MyServerCallbacks : public BLEServerCallbacks {
                   motionEstop ? "OFF" : "ON");
 
     delay(100);
-    BLEDevice::startAdvertising();
+    NimBLEDevice::startAdvertising();
   }
 };
 
-class AuthCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
+class AuthCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     try {
     // Accept encrypted auth payload: IV(12) | CIPHER | TAG(16) encoded as hex or raw
     std::string data = pCharacteristic->getValue();
@@ -1753,7 +1758,7 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
       //pBLEServer->disconnect(connId);
     }
     } catch (...) {
-      // A BLE GATT callback runs on the Bluedroid stack's own task — an
+      // A BLE GATT callback runs on the NimBLE host's own task — an
       // uncaught C++ exception here (e.g. std::bad_alloc from a std::string
       // allocation when heap is critically low, observed in practice right
       // around this exact auth-complete moment) used to propagate up
@@ -1775,8 +1780,8 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
 // this 5-field frame for PLC14, unlike PLC38's 10-field frame.
 // estop=1 → E-STOP output OFF and ALL outputs OFF (emergency stop)
 // estop=0 → E-STOP output ON and up/down/left/right follow command values
-class DigitalCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
+class DigitalCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     try {
     // Reject commands from unauthenticated clients
     if (!authenticated) {
@@ -1916,8 +1921,8 @@ class DigitalCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-class HeartbeatCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
+class HeartbeatCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     try {
     if (!authenticated) {
       Serial.println("Heartbeat ignored — not authenticated");
@@ -1991,7 +1996,7 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
 // Operator may add nobody. (The Super Admin has no BLE access.)
 // The BLE task only validates and queues the request; the flash write and
 // the final reply happen from loop(), like the SD login/logout events.
-BLECharacteristic *userMgmtChar = nullptr;
+NimBLECharacteristic *userMgmtChar = nullptr;
 
 volatile bool pendingAddUserFlag = false;
 char          pendingAddReqId[12] = "";
@@ -2043,8 +2048,8 @@ static bool isCleanText(const std::string &s) {
   return true;
 }
 
-class UserMgmtCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
+class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     try {
     if (!authenticated) {
       Serial.println("UserMgmt rejected — not authenticated");
@@ -2255,7 +2260,7 @@ static void processPendingAddUser() {
 #define LOG_MIN_PEER_MTU          210   // 205-byte largest notification + 3 ATT header
 #define LOG_MIN_PEER_MTU_JSON     231   // JSON: 200-byte largest plaintext + 28 framing + 3 ATT header
 
-BLECharacteristic *logChar = nullptr;
+NimBLECharacteristic *logChar = nullptr;
 static SemaphoreHandle_t logTxMutex = nullptr;
 
 enum LogJobType : uint8_t { LOGJOB_MONTHS, LOGJOB_DATES, LOGJOB_DAY };
@@ -2300,11 +2305,13 @@ static void sendLogFail(const char *reason, bool json) {
 
 // SD.open() can throw std::bad_alloc under low heap (see logEvent()).
 static bool openSd(const String &path, File &f) {
+  if (!sdOk) return false;
   try {
     f = SD.open(path, FILE_READ);
   } catch (...) {
     return false;
   }
+  if (!f) sdCheckAfterFailedOpen();
   return (bool)f;
 }
 
@@ -2315,8 +2322,8 @@ static String baseName(const char *n) {
   return sl >= 0 ? s.substring(sl + 1) : s;
 }
 
-class LogCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
+class LogCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     try {
     if (!authenticated) {
       Serial.println("EventLog rejected — not authenticated");
@@ -2723,6 +2730,7 @@ void setup() {
     syncTimeCache();
   }
 
+  spiBusSwitchBegin();
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("SD card not found — event logging disabled");
     sdOk = false;
@@ -2732,6 +2740,15 @@ void setup() {
   }
 
   ethDiagInit();  // W5500 detect on the shared VSPI bus; after SD.begin(), diagnostic only
+
+  // SD.begin() passing above says nothing about the card after Ethernet bring-up.
+  if (sdOk) {
+    File sdRoot = SD.open("/");
+    sdOk = sdRoot && sdRoot.isDirectory();
+    sdRoot.close();
+    Serial.printf("SD card after Ethernet init: %s\n", sdOk ? "OK" : "NOT RESPONDING - event logging off");
+  }
+  Serial.printf("RTC after Ethernet init: %s\n", syncTimeCache() ? "OK" : "NOT RESPONDING");
 
   loadUsers();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
@@ -2764,82 +2781,105 @@ void setup() {
 
   setupWebRoutes();
 
-  // This app only ever uses BLE (BLECharacteristic/BLEServer/etc. —
-  // nothing here touches classic Bluetooth/SPP), but the ESP32's BT
-  // controller reserves memory for BOTH classic BT and BLE by default,
-  // whether or not classic BT is ever used. Releasing the unused classic
-  // BT portion here — the one point in boot where it's still possible,
-  // strictly before the controller initializes inside BLEDevice::init()
-  // below — hands back roughly 70KB to the heap for the rest of this
-  // app's lifetime. Given every OOM this firmware has hit this session
-  // (WiFi's internal logger, SD.open(), a BLE notify's std::string,
-  // WebServer's own read buffer) traces back to chronically low free
-  // heap (as little as ~43KB reported right at boot, before any client
-  // even connects), this single call is likely a bigger win than any of
-  // those individual fixes.
-  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  // NimBLE, not the framework's Bluedroid: it is BLE-only, and leaves enough
+  // heap for the cloud link's TLS. This board's every OOM (WiFi's internal
+  // logger, SD.open(), a BLE notify's std::string, WebServer's read buffer)
+  // came from chronically low free heap: ~45KB after boot under Bluedroid.
+  // NimBLEDevice::init() also releases the unused classic BT controller memory.
+  NimBLEDevice::init(bleName);
+  // Bluedroid's default, and required: the app asks for 512 and sends a login as
+  // a single write, so a smaller MTU (NimBLE's default is 255) can refuse it.
+  NimBLEDevice::setMTU(517);
 
-  BLEDevice::init(bleName);
-
-  pBLEServer = BLEDevice::createServer();
+  pBLEServer = NimBLEDevice::createServer();
   pBLEServer->setCallbacks(new MyServerCallbacks());
 
-  BLEService *pService = pBLEServer->createService(BLEUUID(SERVICE_UUID), BLE_SERVICE_HANDLE_COUNT);
+  NimBLEService *pService = pBLEServer->createService(NimBLEUUID(SERVICE_UUID));
 
 
   digitalChar = pService->createCharacteristic(
     DIGITAL_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE_NR
+    NIMBLE_PROPERTY::WRITE_NR
   );
   digitalChar->setCallbacks(new DigitalCallbacks());
 
   authChar = pService->createCharacteristic(
     AUTH_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
   );
-  authChar->addDescriptor(new BLE2902());
   authChar->setCallbacks(new AuthCallbacks());
 
   statusChar = pService->createCharacteristic(
     STATUS_CHAR_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY
+    NIMBLE_PROPERTY::NOTIFY
   );
-  statusChar->addDescriptor(new BLE2902());
 
   heartbeatChar = pService->createCharacteristic(
     HEARTBEAT_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE_NR
+    NIMBLE_PROPERTY::WRITE_NR
   );
   heartbeatChar->setCallbacks(new HeartbeatCallbacks());
 
-  pService->start();
 
   // Second service: user management (ADD_USER) from the mobile app.
-  BLEService *pUserService = pBLEServer->createService(BLEUUID(USERMGMT_SERVICE_UUID), BLE_USERMGMT_HANDLE_COUNT);
+  NimBLEService *pUserService = pBLEServer->createService(NimBLEUUID(USERMGMT_SERVICE_UUID));
   userMgmtChar = pUserService->createCharacteristic(
     USERMGMT_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
   );
-  userMgmtChar->addDescriptor(new BLE2902());
   userMgmtChar->setCallbacks(new UserMgmtCallbacks());
 
   // Event log browsing/download (Admin only) — see "EVENT LOG over BLE".
   logChar = pUserService->createCharacteristic(
     LOG_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
   );
-  logChar->addDescriptor(new BLE2902());
   logChar->setCallbacks(new LogCallbacks());
-  pUserService->start();
 
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  BLEAdvertisementData advertData;
-  advertData.setManufacturerData("PLC14");
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  // The app recognises a PLC by this manufacturer data. As under Bluedroid, the
+  // service UUID and name go in the scan response: both do not fit in the packet.
+  NimBLEAdvertisementData advertData;
+  advertData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  advertData.setManufacturerData(std::string("PLC14"));
   pAdvertising->setAdvertisementData(advertData);
-  pAdvertising->addServiceUUID(SERVICE_UUID);
+  NimBLEAdvertisementData scanData;
+  scanData.addServiceUUID(SERVICE_UUID);
+  scanData.setName(bleName);
+  pAdvertising->setScanResponseData(scanData);
+  pAdvertising->enableScanResponse(true);
+  pBLEServer->start();
   pAdvertising->start();
 
-  Serial.printf("BLE Ready... (free heap: %u bytes)\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("BLE Ready... (free heap: %u bytes, largest block: %u)\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
+  // Last in boot. With a login stored, the cloud_link task takes over the W5500.
+  cloudLinkBegin();
+}
+
+// Hands the cloud task a snapshot of the state it reports, once a second. The
+// task never reads these variables itself: it runs on the other core, and this
+// way a heartbeat always describes one consistent moment. estop is motionEstop
+// as it stands: true means the E-STOP is engaged and the relay is off.
+static void publishCloudStatus() {
+  static unsigned long lastPublishMs = 0;
+  if (lastPublishMs != 0 && millis() - lastPublishMs < 1000) return;
+  lastPublishMs = millis();
+
+  CloudStatus s = {};
+  if (timeCacheValid) strlcpy(s.rtc, currentTimestamp().c_str(), sizeof(s.rtc));
+  s.rtcOk   = rtcOk;
+  s.sdOk    = sdOk;
+  s.estop   = motionEstop;
+  s.up      = motionUp;
+  s.down    = motionDown;
+  s.left    = motionLeft;
+  s.right   = motionRight;
+  s.bleConn = deviceConnected;
+  s.bleAuth = authenticated;
+  strlcpy(s.bleUser, connectedUserEmail, sizeof(s.bleUser));
+  cloudLinkPublish(s);
 }
 
 void loop() {
@@ -3003,7 +3043,8 @@ void loop() {
     }
   }
 
-  ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
+  if (cloudLinkRunning()) publishCloudStatus();
+  else ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
 
   handleWiFi(); // does nothing in AP mode
   webServer.handleClient();
