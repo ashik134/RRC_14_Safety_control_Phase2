@@ -858,6 +858,7 @@ static String sidebarHtml(const String &role, const String &active)
     h += navItem("ota", "cloud", "Firmware Update", active);
     if (cloudLinkAvailable())
       h += navItem("cloud", "wifi", "Cloud Link", active);
+    h += navItem("firebase", "cloud", "Firebase", active);
     h += navItem("files", "folder", "Files", active);
   }
   h += "</nav><div class='side-foot'><b>IntelliControl</b>" FIRMWARE_VERSION "</div></aside>";
@@ -1532,7 +1533,9 @@ static void handleRoot()
     activeTab = "home";
   if ((!isAdmin || !cloudLinkAvailable()) && activeTab == "cloud")
     activeTab = "home";
-  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "devices" && activeTab != "inconfig" && activeTab != "time" && activeTab != "ota" && activeTab != "files" && activeTab != "cloud")
+  if (!isAdmin && activeTab == "firebase")
+    activeTab = "home";
+  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "devices" && activeTab != "inconfig" && activeTab != "time" && activeTab != "ota" && activeTab != "files" && activeTab != "cloud" && activeTab != "firebase")
     activeTab = defaultTab;
   bool isHome = (activeTab == "home");
   bool isUsers = (activeTab == "users");
@@ -1544,6 +1547,7 @@ static void handleRoot()
   bool isOta = (activeTab == "ota");
   bool isFiles = (activeTab == "files");
   bool isCloud = (activeTab == "cloud");
+  bool isFirebase = (activeTab == "firebase");
 
   // fragMode: an AJAX tab-switch request (see showTab() in the page shell
   // script below) asking only for the active tab's own markup, not the
@@ -1922,6 +1926,49 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
     }
     html += "</div>"; // end card
     html += "</div>"; // end tab-cloud
+  }
+  mayFlush();
+
+  // ====== FIREBASE PANEL (Realtime Database push, Admin only) ======
+  if (isAdmin && isFirebase)
+  {
+    FirebaseSettings fbCfg;
+    FirebaseInfo fb;
+    cloudLinkGetFirebase(fbCfg, fb);
+    memset(fbCfg.secret, 0, sizeof(fbCfg.secret)); // only fb.hasSecret is used below
+    html += "<div id='tab-firebase' class='page page-narrow'>";
+    html += panelHead("cloud", "Firebase", "Sends this PLC's heartbeat and status to the BLE Face Access device record in the online web app. Crane control does not depend on it.");
+    if (webServer.hasArg("saved"))
+      html += alertHtml("success", "Saved. The PLC will try to connect within a few seconds.");
+    html += "<div class='card'><dl class='kv'>";
+    html += kvItem("Status", htmlEsc(String(fb.state)));
+    html += kvItem("Push", fb.enabled ? String("Enabled") : String("Disabled"));
+    html += kvItem("Device record", fb.deviceId[0] ? "devices/" + htmlEsc(String(fb.deviceId)) : String("&mdash;"));
+    html += kvItem("Database secret", fb.hasSecret ? String("Saved") : String("&mdash;"));
+    html += kvItem("Last push", fb.everOk ? String((unsigned long)fb.lastOkAgoS) + " s ago" : String("None since boot"));
+    html += kvItem("Pushes sent / failed", String((unsigned long)fb.okCount) + " / " + String((unsigned long)fb.failCount));
+    html += "</dl></div>";
+    html += "<div class='card'>";
+    html += "<form method='POST' action='/firebase'>";
+    html += "<div class='form-group'><label for='fb-id'>Device ID</label><input id='fb-id' name='deviceId' maxlength='32' autocomplete='off' spellcheck='false' value='" +
+            htmlEsc(String(fb.deviceId)) + "' required></div>";
+    html += "<div class='form-group'><label for='fb-secret'>Firebase Database Secret</label><input id='fb-secret' name='secret' type='password' maxlength='64' autocomplete='off' placeholder='" +
+            String(fb.hasSecret ? "Saved - leave blank to keep it" : "") + "'" + String(fb.hasSecret ? "" : " required") + "></div>";
+    html += "<div class='form-group'><label for='fb-url'>Realtime Database URL</label><input id='fb-url' name='dbUrl' maxlength='96' autocomplete='off' spellcheck='false' placeholder='https://your-project-default-rtdb.firebaseio.com' value='" +
+            htmlEsc(String(fb.dbUrl)) + "' required></div>";
+    html += "<div class='form-group'><label class='check' for='fb-en'><input type='checkbox' id='fb-en' name='enabled' value='1'" +
+            String(fb.enabled ? " checked" : "") + "><span>Enable Firebase Push</span></label></div>";
+    html += alertHtml("info", "When this device is created in the web app it gets a unique ID. Copy that ID into Device ID. The secret is under Firebase Console &gt; Project settings &gt; Service accounts &gt; Database secrets. It cannot be read back from this page.");
+    html += "<div class='form-actions'><button type='submit' class='btn btn-primary'>Save</button></div>";
+    html += "</form>";
+    if (fb.deviceId[0] || fb.hasSecret || fb.dbUrl[0])
+    {
+      html += "<form method='POST' action='/firebase/clear'><div class='form-actions'>";
+      html += "<button type='submit' class='btn btn-outline'>Remove settings and stop pushing</button>";
+      html += "</div></form>";
+    }
+    html += "</div>"; // end card
+    html += "</div>"; // end tab-firebase
   }
   mayFlush();
 
@@ -2447,6 +2494,76 @@ static void handleCloudClearPost()
     return;
   cloudLinkClear();
   webServer.sendHeader("Location", "/?tab=cloud");
+  sendSafe(303);
+}
+
+// ============================================================
+//  Firebase POST — store the Realtime Database settings (Admin only)
+// ============================================================
+static void handleFirebasePost()
+{
+  if (!webAuthAdmin())
+    return;
+  String id = webServer.arg("deviceId");
+  String url = webServer.arg("dbUrl");
+  String secret = webServer.arg("secret");
+  id.trim();
+  url.trim();
+  secret.trim();
+  bool enabled = webServer.hasArg("enabled");
+
+  FirebaseSettings cur;
+  FirebaseInfo info;
+  cloudLinkGetFirebase(cur, info);
+  if (secret.length() == 0)
+    secret = cur.secret; // left blank: keep the saved one
+
+  char host[80] = "";
+  if (id.length() > 0 && !cloudValidDeviceId(id.c_str()))
+  {
+    sendSafe(400, "text/html", errorPage("Device ID must be 1-32 letters, digits, '-' or '_'. Copy it exactly from the web app.", "/?tab=firebase"));
+    return;
+  }
+  if (secret.length() > 0 && !cloudValidDbSecret(secret.c_str()))
+  {
+    sendSafe(400, "text/html", errorPage("Database secret is not valid (letters, digits, '-', '_' and '.' only, up to 64).", "/?tab=firebase"));
+    return;
+  }
+  if (url.length() > 0 && !cloudParseDbHost(url.c_str(), host, sizeof(host)))
+  {
+    sendSafe(400, "text/html", errorPage("Database URL must be an https:// address ending in .firebaseio.com or .firebasedatabase.app.", "/?tab=firebase"));
+    return;
+  }
+  if (enabled && (id.length() == 0 || secret.length() == 0 || url.length() == 0))
+  {
+    sendSafe(400, "text/html", errorPage("Device ID, database secret and database URL are all needed to enable Firebase Push.", "/?tab=firebase"));
+    return;
+  }
+
+  FirebaseSettings next = {};
+  next.enabled = enabled;
+  strlcpy(next.deviceId, id.c_str(), sizeof(next.deviceId));
+  strlcpy(next.secret, secret.c_str(), sizeof(next.secret));
+  if (url.length() > 0)
+    snprintf(next.dbUrl, sizeof(next.dbUrl), "https://%s", host); // stored without any trailing slash
+  bool saved = cloudLinkSaveFirebase(next);
+  memset(&next, 0, sizeof(next));
+  memset(&cur, 0, sizeof(cur));
+  if (!saved)
+  {
+    sendSafe(500, "text/html", errorPage("Could not save to device storage.", "/?tab=firebase"));
+    return;
+  }
+  webServer.sendHeader("Location", "/?tab=firebase&saved=1");
+  sendSafe(303);
+}
+
+static void handleFirebaseClearPost()
+{
+  if (!webAuthAdmin())
+    return;
+  cloudLinkClearFirebase();
+  webServer.sendHeader("Location", "/?tab=firebase");
   sendSafe(303);
 }
 
@@ -3480,6 +3597,8 @@ void setupWebRoutes()
   webServer.on("/devices/delete", HTTP_POST, handleDeleteDevicePost);
   webServer.on("/cloud", HTTP_POST, handleCloudPost);
   webServer.on("/cloud/clear", HTTP_POST, handleCloudClearPost);
+  webServer.on("/firebase", HTTP_POST, handleFirebasePost);
+  webServer.on("/firebase/clear", HTTP_POST, handleFirebaseClearPost);
   webServer.on("/ota", HTTP_POST, handleOtaComplete, handleOtaUpload);
   webServer.on("/files/download", HTTP_GET, handleFileDownload);
   webServer.on("/files/edit", HTTP_GET, handleFileEditGet);

@@ -84,18 +84,46 @@ static mbedtls_x509_crt  roots;
 
 static Creds creds = {};   // the network task's own copy
 
-static void setState(const char *fmt, ...) {
-  char msg[sizeof(sharedState)];
-  va_list ap;
-  va_start(ap, fmt);
+// Realtime Database push: same pattern, its own settings and counters. Never
+// log or show `secret`: it is a key to the whole database.
+static FirebaseSettings fbSaved       = {};
+static bool             fbChanged     = false;
+static char             fbState[96]   = "Not configured";
+static uint32_t         fbOkCount     = 0;
+static uint32_t         fbFailCount   = 0;
+static bool             fbEverOk      = false;
+static unsigned long    fbLastOkMs    = 0;
+
+static FirebaseSettings fb = {};       // the network task's own copy
+static char             fbHost[80] = "";
+
+// Pushed to the web app as devices/{id}/heartbeatIntervalSec: it treats the PLC
+// as offline after this plus 60 s of silence.
+static const unsigned FB_HEARTBEAT_S = 60;
+
+static void setStateIn(char *dst, size_t cap, const char *tag, const char *fmt, va_list ap) {
+  char msg[96];
   vsnprintf(msg, sizeof(msg), fmt, ap);
-  va_end(ap);
 
   taskENTER_CRITICAL(&mux);
-  bool changed = strcmp(msg, sharedState) != 0;
-  if (changed) memcpy(sharedState, msg, sizeof(sharedState));
+  bool changed = strcmp(msg, dst) != 0;
+  if (changed) memcpy(dst, msg, cap);
   taskEXIT_CRITICAL(&mux);
-  if (changed) Serial.printf("[CLOUD] %s\n", msg);
+  if (changed) Serial.printf("[%s] %s\n", tag, msg);
+}
+
+static void setState(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  setStateIn(sharedState, sizeof(sharedState), "CLOUD", fmt, ap);
+  va_end(ap);
+}
+
+static void setFbState(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  setStateIn(fbState, sizeof(fbState), "FIREBASE", fmt, ap);
+  va_end(ap);
 }
 
 // ---------------- mbedTLS transport over EthernetClient ----------------
@@ -142,12 +170,13 @@ static bool sslWriteAll(mbedtls_ssl_context *ssl, const char *data, size_t len) 
   return true;
 }
 
-// One complete HTTPS POST. HTTP/1.0 keeps the reply simple: no chunked encoding,
-// and the server closes the connection at the end. The whole reply lands in
-// mem->resp, NUL-terminated. Returns the HTTP status, or 0 with `stage` naming
-// the step that failed. The certificate is always verified, so the device key
-// and token only ever go to Google.
-static int httpsPost(const char *host, const char *path, const char *bearer, const char *body, const char *&stage) {
+// One complete HTTPS request (POST, or PATCH for the Realtime Database).
+// HTTP/1.0 keeps the reply simple: no chunked encoding, and the server closes
+// the connection at the end. The whole reply lands in mem->resp, NUL-terminated.
+// Returns the HTTP status, or 0 with `stage` naming the step that failed. The
+// certificate is always verified, so the device key, token and database secret
+// only ever go to Google.
+static int httpsRequest(const char *method, const char *host, const char *path, const char *bearer, const char *body, const char *&stage) {
   mem->resp[0] = '\0';
 
   stage = "DNS lookup";
@@ -193,12 +222,12 @@ static int httpsPost(const char *host, const char *path, const char *bearer, con
   int status = 0;
   if (err == 0) {
     stage = "HTTP request";
-    char head[320];
+    char head[448];   // the Realtime Database path carries the secret: up to ~120 bytes
     size_t bodyLen = strlen(body);
     int n = snprintf(head, sizeof(head),
-                     "POST %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: plc14\r\nContent-Type: application/json\r\n"
+                     "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: plc14\r\nContent-Type: application/json\r\n"
                      "Content-Length: %u\r\nConnection: close\r\n",
-                     path, host, (unsigned)bodyLen);
+                     method, path, host, (unsigned)bodyLen);
     bool sent = n > 0 && (size_t)n < sizeof(head) && sslWriteAll(&ssl, head, (size_t)n);
     if (sent && bearer) {
       sent = sslWriteAll(&ssl, "Authorization: Bearer ", 22) && sslWriteAll(&ssl, bearer, strlen(bearer)) &&
@@ -242,7 +271,7 @@ static Outcome signIn() {
   snprintf(path, sizeof(path), "/v1/accounts:signInWithPassword?key=%s", creds.apiKey);
 
   const char *stage = "";
-  int status = httpsPost(AUTH_HOST, path, nullptr, mem->body, stage);
+  int status = httpsRequest("POST", AUTH_HOST, path, nullptr, mem->body, stage);
   memset(mem->body, 0, sizeof(mem->body));   // it held the device key
   if (status == 0) {
     setState("Sign-in failed at: %s", stage);
@@ -275,7 +304,7 @@ static bool sendHeartbeat() {
   }
 
   const char *stage = "";
-  int status = httpsPost(FIRESTORE_HOST, COMMIT_PATH, mem->token, mem->body, stage);
+  int status = httpsRequest("POST", FIRESTORE_HOST, COMMIT_PATH, mem->token, mem->body, stage);
   if (status == 200) return true;
   if (status == 0) {
     setState("Heartbeat failed at: %s", stage);
@@ -287,6 +316,48 @@ static bool sendHeartbeat() {
   // A refused token may just be stale (or the key replaced): sign in afresh.
   if (status == 401 || status == 403) mem->token[0] = '\0';
   return false;
+}
+
+// Writes the heartbeat and status to devices/{deviceId} in the Realtime
+// Database. PATCH merges: it never removes what the web app keeps there
+// (phonelist, employees, ...). Returns Rejected when retrying soon cannot help.
+static Outcome sendFirebasePush() {
+  CloudStatus s;
+  taskENTER_CRITICAL(&mux);
+  s = sharedStatus;
+  taskEXIT_CRITICAL(&mux);
+  strlcpy(s.ip, Ethernet.localIP().toString().c_str(), sizeof(s.ip));
+  s.uptimeS = (uint32_t)(esp_timer_get_time() / 1000000LL);
+
+  char path[160];   // holds the secret: keep it off the heap and out of every log
+  size_t pathLen = cloudBuildDevicePath(path, sizeof(path), fb.deviceId, fb.secret);
+  if (pathLen == 0 || cloudBuildDeviceUpdate(mem->body, sizeof(mem->body), FIRMWARE_VERSION, FB_HEARTBEAT_S, s) == 0) {
+    memset(path, 0, sizeof(path));
+    setFbState("Settings invalid or status too long to send");
+    return Outcome::Rejected;
+  }
+
+  const char *stage = "";
+  int status = httpsRequest("PATCH", fbHost, path, nullptr, mem->body, stage);
+  memset(path, 0, sizeof(path));
+  if (status == 200) return Outcome::Ok;
+  if (status == 0) {
+    setFbState("Push failed at: %s", stage);
+    return Outcome::Failed;
+  }
+
+  char why[64] = "";
+  cloudJsonString(mem->resp, "error", why, sizeof(why));
+  if (status == 401 || status == 403) {
+    setFbState("Database secret refused (HTTP %d) %s", status, why);
+    return Outcome::Rejected;
+  }
+  if (status == 404) {
+    setFbState("Database not found (HTTP 404): check the Database URL");
+    return Outcome::Rejected;
+  }
+  setFbState("Push refused (HTTP %d) %s", status, why);
+  return status >= 500 ? Outcome::Failed : Outcome::Rejected;
 }
 
 // Takes up memory the first time a configured PLC needs it.
@@ -309,12 +380,18 @@ static bool prepareTls() {
 
 // ---------------- the task ----------------
 
+// Realtime Database push is on only with a complete, valid configuration; the
+// host is parsed once, when the settings arrive.
+static bool fbActive() { return fb.enabled && fbHost[0] && cloudValidDeviceId(fb.deviceId) && cloudValidDbSecret(fb.secret); }
+
 static void cloudStep() {
-  static bool          netUp       = false;
-  static unsigned long nextDhcpMs  = 0;
-  static unsigned long nextBeatMs  = 0;
-  static unsigned long tokenAtMs   = 0;
-  static uint32_t      failStreak  = 0;
+  static bool          netUp        = false;
+  static unsigned long nextDhcpMs   = 0;
+  static unsigned long nextBeatMs   = 0;
+  static unsigned long nextFbMs     = 0;
+  static unsigned long tokenAtMs    = 0;
+  static uint32_t      failStreak   = 0;
+  static uint32_t      fbFailStreak = 0;
 
   unsigned long now = millis();
 
@@ -324,42 +401,62 @@ static void cloudStep() {
     creds = savedCreds;
     credsChanged = false;
   }
+  bool fbNew = fbChanged;
+  if (fbNew) {
+    fb = fbSaved;
+    fbChanged = false;
+  }
   taskEXIT_CRITICAL(&mux);
   if (changed) {
     if (mem) mem->token[0] = '\0';
     failStreak = 0;
     nextBeatMs = now;
   }
-
-  if (!creds.plcId[0]) {
-    setState("Not configured");
-    return;
+  if (fbNew) {
+    if (!cloudParseDbHost(fb.dbUrl, fbHost, sizeof(fbHost))) fbHost[0] = '\0';
+    fbFailStreak = 0;
+    nextFbMs = now;
   }
+
+  // Firestore needs a project in the build; the Realtime Database push does not.
+  bool fsOn = PROJECT_ID && creds.plcId[0];
+  bool fbOn = fbActive();
+  if (!fsOn) setState("%s", creds.plcId[0] ? "No cloud project set in this build" : "Not configured");
+  if (!fbOn) setFbState("%s", fb.enabled ? "Settings incomplete" : (fb.deviceId[0] ? "Disabled" : "Not configured"));
+  if (!fsOn && !fbOn) return;
+
+  // Network trouble is shown on every service that is waiting for the network.
+  auto netState = [&](const char *msg) {
+    if (fsOn) setState("%s", msg);
+    if (fbOn) setFbState("%s", msg);
+  };
 
   EthDiagStatus eth = ethDiagGetStatus();
   if (!eth.chipDetected) {
-    setState("No Ethernet hardware detected");
+    netState("No Ethernet hardware detected");
     return;
   }
   if (!eth.linkUp) {
     netUp = false;
-    setState("Ethernet cable not connected");
+    netState("Ethernet cable not connected");
     return;
   }
 
   if (!netUp) {
     if ((long)(now - nextDhcpMs) < 0) return;
-    setState("Requesting an address (DHCP)");
+    netState("Requesting an address (DHCP)");
     netUp = ethDiagStartDhcp();
     if (!netUp) {
       nextDhcpMs = millis() + DHCP_RETRY_MS;
-      setState("No DHCP server on this network");
+      netState("No DHCP server on this network");
       return;
     }
     now = millis();
   }
 
-  if ((long)(now - nextBeatMs) < 0) return;
+  bool fsDue = fsOn && (long)(now - nextBeatMs) >= 0;
+  bool fbDue = fbOn && (long)(now - nextFbMs) >= 0;
+  if (!fsDue && !fbDue) return;
 
   int lease = Ethernet.maintain();
   if (lease == DHCP_CHECK_RENEW_FAIL || lease == DHCP_CHECK_REBIND_FAIL) {
@@ -369,39 +466,77 @@ static void cloudStep() {
 
   if (ESP.getFreeHeap() < TLS_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < TLS_MIN_LARGEST || !prepareTls()) {
     // In whole KB: a figure that moves every retry would reprint this line each time.
-    setState("Waiting for free memory (%u KB free, %u KB largest)", (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
-    nextBeatMs = now + HEAP_RETRY_MS;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Waiting for free memory (%u KB free, %u KB largest)", (unsigned)(ESP.getFreeHeap() / 1024),
+             (unsigned)(ESP.getMaxAllocHeap() / 1024));
+    if (fsDue) {
+      setState("%s", msg);
+      nextBeatMs = now + HEAP_RETRY_MS;
+    }
+    if (fbDue) {
+      setFbState("%s", msg);
+      nextFbMs = now + HEAP_RETRY_MS;
+    }
     return;
   }
 
-  Outcome outcome = Outcome::Ok;
-  if (!mem->token[0] || now - tokenAtMs >= TOKEN_LIFE_MS) {
-    outcome = signIn();
-    if (outcome == Outcome::Ok) tokenAtMs = millis();
-  }
-  if (outcome == Outcome::Ok && !sendHeartbeat()) outcome = Outcome::Failed;
+  // One TLS session at a time: each needs ~50 KB. Firestore first, as before.
+  if (fsDue) {
+    Outcome outcome = Outcome::Ok;
+    if (!mem->token[0] || now - tokenAtMs >= TOKEN_LIFE_MS) {
+      outcome = signIn();
+      if (outcome == Outcome::Ok) tokenAtMs = millis();
+    }
+    if (outcome == Outcome::Ok && !sendHeartbeat()) outcome = Outcome::Failed;
 
-  if (outcome == Outcome::Ok) {
-    failStreak = 0;
-    nextBeatMs = now + HEARTBEAT_MS;
-    taskENTER_CRITICAL(&mux);
-    okCount++;
-    everOk   = true;
-    lastOkMs = millis();
-    taskEXIT_CRITICAL(&mux);
-    setState("Connected");
-    Serial.printf("[CLOUD] Report sent (heap %u free, lowest since boot %u, stack unused %u)\n", (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-    return;
+    if (outcome == Outcome::Ok) {
+      failStreak = 0;
+      nextBeatMs = now + HEARTBEAT_MS;
+      taskENTER_CRITICAL(&mux);
+      okCount++;
+      everOk   = true;
+      lastOkMs = millis();
+      taskEXIT_CRITICAL(&mux);
+      setState("Connected");
+      Serial.printf("[CLOUD] Report sent (heap %u free, lowest since boot %u, stack unused %u)\n", (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    } else {
+      taskENTER_CRITICAL(&mux);
+      failCount++;
+      taskEXIT_CRITICAL(&mux);
+      unsigned long wait = outcome == Outcome::Rejected ? RETRY_MAX_MS : RETRY_MIN_MS << (failStreak < 5 ? failStreak : 5);
+      if (wait > RETRY_MAX_MS) wait = RETRY_MAX_MS;
+      failStreak++;
+      nextBeatMs = millis() + wait;
+    }
   }
 
-  taskENTER_CRITICAL(&mux);
-  failCount++;
-  taskEXIT_CRITICAL(&mux);
-  unsigned long wait = outcome == Outcome::Rejected ? RETRY_MAX_MS : RETRY_MIN_MS << (failStreak < 5 ? failStreak : 5);
-  if (wait > RETRY_MAX_MS) wait = RETRY_MAX_MS;
-  failStreak++;
-  nextBeatMs = millis() + wait;
+  if (fbDue && ESP.getFreeHeap() >= TLS_MIN_FREE_HEAP && ESP.getMaxAllocHeap() >= TLS_MIN_LARGEST) {
+    Outcome outcome = sendFirebasePush();
+    if (outcome == Outcome::Ok) {
+      fbFailStreak = 0;
+      nextFbMs = millis() + FB_HEARTBEAT_S * 1000UL;
+      taskENTER_CRITICAL(&mux);
+      fbOkCount++;
+      fbEverOk   = true;
+      fbLastOkMs = millis();
+      taskEXIT_CRITICAL(&mux);
+      setFbState("Connected");
+      Serial.printf("[FIREBASE] Push sent (heap %u free, lowest since boot %u, stack unused %u)\n", (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    } else {
+      taskENTER_CRITICAL(&mux);
+      fbFailCount++;
+      taskEXIT_CRITICAL(&mux);
+      unsigned long wait = outcome == Outcome::Rejected ? RETRY_MAX_MS : RETRY_MIN_MS << (fbFailStreak < 5 ? fbFailStreak : 5);
+      if (wait > RETRY_MAX_MS) wait = RETRY_MAX_MS;
+      fbFailStreak++;
+      nextFbMs = millis() + wait;
+    }
+  } else if (fbDue) {
+    // The Firestore session just used the memory: try again shortly.
+    nextFbMs = millis() + HEAP_RETRY_MS;
+  }
 }
 
 static void cloudTask(void *) {
@@ -426,25 +561,32 @@ static void loadCreds() {
   credsChanged = true;
 }
 
+static void loadFirebase() {
+  Preferences p;
+  if (!p.begin("fbcfg", true)) return;   // namespace absent: never configured
+  p.getString("id", fbSaved.deviceId, sizeof(fbSaved.deviceId));
+  p.getString("sec", fbSaved.secret, sizeof(fbSaved.secret));
+  p.getString("url", fbSaved.dbUrl, sizeof(fbSaved.dbUrl));
+  fbSaved.enabled = p.getBool("en", false);
+  p.end();
+  fbChanged = true;
+}
+
 static volatile bool taskRunning = false;
 
-// Started only once a login exists: the stack is 12 KB of a heap that can be
-// as low as ~45 KB, which an unconfigured PLC should not have to give up.
+// Started only once something is configured: the stack is 12 KB of a heap that
+// can be as low as ~45 KB, which an unconfigured PLC should not have to give up.
 // Core 0, lowest application priority: the layout the spike tested. The BLE
 // and Wi-Fi stacks preempt it, and loop() on core 1 is never blocked by it.
 static void startTask() {
   if (taskRunning) return;
-  if (!PROJECT_ID) {
-    // Leaves the W5500 with loop(), as on an unconfigured PLC.
-    setState("No cloud project set in this build");
-    return;
-  }
   // Set first: loop() must stop using the W5500 before the task starts on it.
   // This always runs on loop()'s own task, so loop() is not mid-poll here.
   taskRunning = true;
   if (xTaskCreatePinnedToCore(cloudTask, "cloud_link", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
     taskRunning = false;
     setState("Not enough memory to start");
+    setFbState("Not enough memory to start");
   }
 }
 
@@ -454,7 +596,14 @@ bool cloudLinkAvailable() { return PROJECT_ID != nullptr; }
 
 void cloudLinkBegin() {
   loadCreds();
-  if (savedCreds.plcId[0]) startTask();
+  loadFirebase();
+  if (PROJECT_ID && savedCreds.plcId[0]) {
+    startTask();
+  } else if (savedCreds.plcId[0]) {
+    // Leaves the W5500 with loop(), as on an unconfigured PLC.
+    setState("No cloud project set in this build");
+  }
+  if (fbSaved.enabled && fbSaved.deviceId[0] && fbSaved.secret[0] && fbSaved.dbUrl[0]) startTask();
 }
 
 void cloudLinkPublish(const CloudStatus &status) {
@@ -493,7 +642,7 @@ bool cloudLinkSave(const String &plcId, const String &login, const String &key, 
   savedCreds   = next;
   credsChanged = true;
   taskEXIT_CRITICAL(&mux);
-  startTask();
+  if (PROJECT_ID) startTask();
   return true;
 }
 
@@ -506,5 +655,56 @@ void cloudLinkClear() {
   taskENTER_CRITICAL(&mux);
   memset(&savedCreds, 0, sizeof(savedCreds));
   credsChanged = true;
+  taskEXIT_CRITICAL(&mux);
+}
+
+// ---------------- Realtime Database settings ----------------
+
+void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info) {
+  char host[80];
+  taskENTER_CRITICAL(&mux);
+  cfg = fbSaved;
+  strlcpy(info.state, fbState, sizeof(info.state));
+  info.everOk     = fbEverOk;
+  info.lastOkAgoS = fbEverOk ? (millis() - fbLastOkMs) / 1000UL : 0;
+  info.okCount    = fbOkCount;
+  info.failCount  = fbFailCount;
+  taskEXIT_CRITICAL(&mux);
+
+  info.enabled   = cfg.enabled;
+  info.hasSecret = cfg.secret[0] != '\0';
+  info.complete  = cloudValidDeviceId(cfg.deviceId) && cloudValidDbSecret(cfg.secret) && cloudParseDbHost(cfg.dbUrl, host, sizeof(host));
+  strlcpy(info.deviceId, cfg.deviceId, sizeof(info.deviceId));
+  strlcpy(info.dbUrl, cfg.dbUrl, sizeof(info.dbUrl));
+}
+
+bool cloudLinkSaveFirebase(const FirebaseSettings &next) {
+  Preferences p;
+  if (!p.begin("fbcfg", false)) return false;
+  size_t idLen  = strlen(next.deviceId);
+  size_t secLen = strlen(next.secret);
+  size_t urlLen = strlen(next.dbUrl);
+  bool ok = p.putString("id", next.deviceId) == idLen && p.putString("sec", next.secret) == secLen &&
+            p.putString("url", next.dbUrl) == urlLen && p.putBool("en", next.enabled) == 1;
+  p.end();
+  if (!ok) return false;
+
+  taskENTER_CRITICAL(&mux);
+  fbSaved   = next;
+  fbChanged = true;
+  taskEXIT_CRITICAL(&mux);
+  if (next.enabled) startTask();
+  return true;
+}
+
+void cloudLinkClearFirebase() {
+  Preferences p;
+  if (p.begin("fbcfg", false)) {
+    p.clear();
+    p.end();
+  }
+  taskENTER_CRITICAL(&mux);
+  memset(&fbSaved, 0, sizeof(fbSaved));
+  fbChanged = true;
   taskEXIT_CRITICAL(&mux);
 }

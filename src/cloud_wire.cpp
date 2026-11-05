@@ -59,6 +59,26 @@ struct Out {
     field(name);
     raw(v ? "{\"booleanValue\":true}" : "{\"booleanValue\":false}");
   }
+
+  // Plain JSON values, as the Realtime Database takes them.
+  void plainString(const char *name, const char *v) {
+    field(name);
+    raw("\"");
+    str(v);
+    raw("\"");
+  }
+
+  void plainBool(const char *name, bool v) {
+    field(name);
+    raw(v ? "true" : "false");
+  }
+
+  void plainUint(const char *name, unsigned long v) {
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%lu", v);
+    field(name);
+    raw(tmp);
+  }
 };
 
 }  // namespace
@@ -191,4 +211,119 @@ bool cloudValidApiKey(const char *s) {
     if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
   }
   return true;
+}
+
+// ---------------- Realtime Database push ----------------
+
+static bool isKeyChar(char c, bool allowDot) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+         (allowDot && c == '.');
+}
+
+bool cloudValidDeviceId(const char *s) {
+  size_t n = strlen(s);
+  if (n < 1 || n > 32) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (!isKeyChar(s[i], false)) return false;
+  }
+  return true;
+}
+
+bool cloudValidDbSecret(const char *s) {
+  size_t n = strlen(s);
+  if (n < 1 || n > 64) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (!isKeyChar(s[i], true)) return false;
+  }
+  return true;
+}
+
+static bool endsWith(const char *s, size_t n, const char *suffix) {
+  size_t m = strlen(suffix);
+  return n > m && memcmp(s + n - m, suffix, m) == 0;
+}
+
+bool cloudParseDbHost(const char *url, char *host, size_t cap) {
+  if (cap == 0) return false;
+  host[0] = '\0';
+
+  const char *p = url;
+  if (strncmp(p, "https://", 8) == 0) {
+    p += 8;
+  } else if (strstr(p, "://")) {
+    return false;   // http:// would send the secret in clear text
+  }
+
+  size_t n = 0;
+  while (p[n] && p[n] != '/') n++;
+  if (p[n] == '/' && p[n + 1] != '\0') return false;   // a path: this is not the database root
+
+  // Lower-case letters, digits, '.' and '-' only: no port, no userinfo, no
+  // look-alike host such as "x.firebaseio.com@evil.example".
+  if (n < 5 || n >= cap) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = p[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-')) return false;
+    host[i] = c;
+  }
+  host[n] = '\0';
+
+  if (host[0] == '.' || host[0] == '-' || strstr(host, "..")) {
+    host[0] = '\0';
+    return false;
+  }
+  if (!endsWith(host, n, ".firebaseio.com") && !endsWith(host, n, ".firebasedatabase.app")) {
+    host[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
+size_t cloudBuildDevicePath(char *out, size_t cap, const char *deviceId, const char *secret) {
+  if (!cloudValidDeviceId(deviceId) || !cloudValidDbSecret(secret)) return 0;
+  int n = snprintf(out, cap, "/devices/%s.json?auth=%s", deviceId, secret);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned heartbeatIntervalS,
+                              const CloudStatus &s) {
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  if (s.rtc[0]) {
+    o.plainString("heartbeat", s.rtc);
+    o.raw(",");
+  }
+  o.plainUint("heartbeatIntervalSec", heartbeatIntervalS);
+  o.raw(",");
+  o.plainString("fw", fw);
+  o.raw(",");
+  o.plainString("localIp", s.ip);
+  o.raw(",");
+
+  o.field("status");
+  o.raw("{");
+  o.plainUint("uptimeS", s.uptimeS);
+  o.raw(",");
+  o.plainBool("rtcOk", s.rtcOk);
+  o.raw(",");
+  o.plainBool("sdOk", s.sdOk);
+  o.raw(",");
+  o.plainBool("estop", s.estop);
+  o.raw(",");
+  o.plainBool("up", s.up);
+  o.raw(",");
+  o.plainBool("down", s.down);
+  o.raw(",");
+  o.plainBool("left", s.left);
+  o.raw(",");
+  o.plainBool("right", s.right);
+  o.raw(",");
+  o.plainBool("bleConn", s.bleConn);
+  o.raw(",");
+  o.plainBool("bleAuth", s.bleAuth);
+  o.raw(",");
+  o.plainString("bleUser", s.bleUser);
+  o.raw("}}");
+  return o.ok ? o.len : 0;
 }

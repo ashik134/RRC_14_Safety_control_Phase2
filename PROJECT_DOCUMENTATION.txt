@@ -827,6 +827,7 @@ Main features
  devices      count, dev_i, owner_i                  Device registry
  webadmin     user, pass                             Web admin credentials
  cloudlink    plc, login, key, api                   Cloud device login
+ fbcfg        id, sec, url, en                       Firebase push (see below)
 
  Defaults are applied when keys are missing/invalid, and values are
  clamped to valid ranges at load time. The partition table keeps the NVS
@@ -846,6 +847,25 @@ Main features
  Each report needs about 50 KB of heap and starts only with 68 KB free. With
  Bluedroid BLE only about 45 KB was free at boot, which is why the firmware
  moved to NimBLE. If memory is short the panel shows "Waiting for free memory".
+
+ Firebase push (web panel > System > Firebase, Admin): the Realtime Database
+ link of a BLE Face Access device, set up like the MA Base Station config page.
+ When the device is created in the online web app it gets a unique ID. The admin
+ pastes that ID into Device ID, plus the Firebase Database Secret and the
+ Realtime Database URL, and ticks Enable Firebase Push. The values are saved in
+ NVS namespace "fbcfg" (this firmware has no EEPROM; NVS is its storage). Every
+ 60 s the cloud task then sends a PATCH to
+     https://<database host>/devices/<Device ID>.json?auth=<secret>
+ with heartbeat (PLC-local "YYYY-MM-DD HH:MM:SS", left out while the clock is
+ unset), heartbeatIntervalSec (60), fw, localIp and a status object (uptimeS,
+ rtcOk, sdOk, estop, up, down, left, right, bleConn, bleAuth, bleUser). PATCH
+ only merges, so what the web app keeps under devices/<id> is never removed.
+ All paths come from cloudBuildDevicePath(), so there is one place that uses
+ the saved Device ID. It does not need CLOUD_PROJECT_ID, runs in the same task
+ and heap rules as Cloud Link, and is one-way: it touches no outputs, E-STOP or
+ BLE. The URL must be an https host ending in .firebaseio.com or
+ .firebasedatabase.app, and the certificate is always verified. The secret is
+ never shown again after saving (leave the field blank to keep it).
 
 
 ================================================================================

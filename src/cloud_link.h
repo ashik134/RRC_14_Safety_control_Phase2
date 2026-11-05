@@ -37,3 +37,34 @@ bool cloudLinkAvailable();
 // is): saving can hand the W5500 over. Returns false if they could not be stored.
 bool cloudLinkSave(const String &plcId, const String &login, const String &key, const String &apiKey);
 void cloudLinkClear();
+
+// ---- Firebase Realtime Database push (local web panel > Firebase) ----
+// Same task and Ethernet port as above, but its own settings: the Device ID
+// copied from the web app, the database secret and the database URL. While
+// enabled and complete, the PLC writes its heartbeat and status to
+// devices/{deviceId} every minute. Independent of CLOUD_PROJECT_ID.
+struct FirebaseSettings {
+  bool enabled;
+  char deviceId[33];
+  char secret[65];
+  char dbUrl[97];
+};
+
+struct FirebaseInfo {
+  bool     enabled;
+  bool     complete;      // Device ID, secret and URL all present and valid
+  bool     hasSecret;     // the secret itself is never handed to the page
+  char     deviceId[33];
+  char     dbUrl[97];
+  char     state[96];
+  bool     everOk;
+  uint32_t lastOkAgoS;    // valid when everOk
+  uint32_t okCount;
+  uint32_t failCount;
+};
+
+// `cfg` includes the secret: for the web handler's validation only, never to show.
+void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info);
+// Same rules as cloudLinkSave(): the caller validates, and runs on loop()'s task.
+bool cloudLinkSaveFirebase(const FirebaseSettings &next);
+void cloudLinkClearFirebase();
