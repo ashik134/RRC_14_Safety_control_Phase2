@@ -867,6 +867,59 @@ Main features
  .firebasedatabase.app, and the certificate is always verified. The secret is
  never shown again after saving (leave the field blank to keep it).
 
+ Phone list sync (same task, same settings, src/cloud_link.cpp). While the
+ Firebase push is on, the Device Registry (devices[], the phones allowed to log
+ in over BLE) is kept in step with the web app's BLE Face Access phone list,
+ the same way the MA devices sync their readers. All paths are under
+ devices/<Device ID>:
+
+   tobesynced                 web app sets true whenever it queues something
+   tobesyncedphoneid/<key>    queue, web -> PLC:
+                                {phoneId, phoneModel, owner?, ownerEmail?, queuedAt}
+                                  = register the phone, or update its owner
+                                {phoneId, action:"remove", queuedAt}
+                                  = delete the phone
+   phonelist/<key>            the web app's list; the PLC writes the phones
+                              registered or deleted on its own Devices page
+                              (source "plc")
+   synchistory/<time>         one record per sync run that applied something:
+                                {type:"phones", status, entries, added, updated,
+                                 removed, rejected, ts, deviceId}
+                              status = success | partial (some rejected)
+                                     | incomplete (stopped early)
+
+ <key> is the phone id trimmed, with . $ # [ ] / and control characters
+ replaced by '_' (cloudPhoneKey(), the same rule as the web app's keyFor).
+
+ Web -> PLC. Every 20 s the PLC reads tobesynced. When it is true the PLC sets
+ it false and then reads the queue, 4 entries per request (orderBy="$key",
+ paged with startAt). Each page is handed to loop(), which applies it to
+ devices[] and saves the registry once (cloudLinkLoop() -> applyCloudPhoneOps()),
+ so devices[] is still only changed on loop()'s task. The PLC then deletes the
+ applied entries, or marks an entry {status:"rejected", reason} (registry full
+ at 20, id missing or longer than 40 characters, unknown action). A rejected
+ entry stays until the web app queues it again. Applying is idempotent:
+ registering a phone the PLC has updates its owner, removing one it does not
+ have succeeds. The owner stored is ownerEmail, else owner (the Devices page
+ calls it "Owner email"). If the registry cannot be saved, the batch is undone
+ and stays queued, and the run is retried after 30 s. A run that applied
+ something is followed by one more, which picks up anything queued meanwhile.
+ The queue is also read once after every boot and after the settings change.
+
+ PLC -> web. A phone registered or deleted on the PLC's Devices page is written
+ to phonelist (up to 4 changes wait in RAM while the network is down). After
+ every boot the PLC also adds any of its phones that phonelist is missing.
+ Phones only the web list has are never removed by the PLC: they may still be
+ waiting in the queue. A deletion made on the PLC while the push is disabled,
+ or lost from the full outbox or at a reboot before it was sent, is therefore
+ not reflected on the web: remove that phone in the web app as well.
+
+ Limits. Each request is a TLS session of its own, so heartbeats always go
+ first and a sync waits for free memory like they do. A change applies from the
+ next BLE login on: a phone that is already connected is not disconnected, as
+ with a change made on the local Devices page. Nothing here touches outputs,
+ E-STOP or the BLE stack. Status: web panel > System > Firebase, "Phone sync".
+
 
 ================================================================================
 19. OTA FIRMWARE UPDATE

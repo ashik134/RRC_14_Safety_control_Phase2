@@ -61,6 +61,10 @@ struct FirebaseInfo {
   uint32_t lastOkAgoS;    // valid when everOk
   uint32_t okCount;
   uint32_t failCount;
+  // Phone list sync with the web app (see cloudLinkLoop()).
+  char     phoneState[96];
+  bool     phoneEverOk;
+  uint32_t phoneLastOkAgoS;   // valid when phoneEverOk
 };
 
 // `cfg` includes the secret: for the web handler's validation only, never to show.
@@ -68,3 +72,25 @@ void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info);
 // Same rules as cloudLinkSave(): the caller validates, and runs on loop()'s task.
 bool cloudLinkSaveFirebase(const FirebaseSettings &next);
 void cloudLinkClearFirebase();
+
+// ---- Phone list sync with the web app (BLE Face Access section) ----
+// While the Firebase push is on, the network task also keeps the Device
+// Registry (devices[]) in step with the web app, the way the MA devices do it:
+//  * web -> PLC: it polls devices/{id}/tobesynced; when true it clears it and
+//    reads the queue devices/{id}/tobesyncedphoneid. Each entry is applied
+//    here, then deleted, or marked {status: "rejected", reason}. Every run
+//    that applied something is logged in devices/{id}/synchistory.
+//  * PLC -> web: phones registered or deleted on this PLC's own web page are
+//    written to devices/{id}/phonelist (source "plc"), and after each boot the
+//    PLC adds any of its phones the web list is missing.
+// It never touches outputs, E-STOP or the BLE link: a change applies from the
+// next BLE login on, like a change made on the local web page.
+
+// Call from loop() on every pass while cloudLinkRunning(). This is where the
+// registry is changed and read for the network task, so devices[] is only
+// ever touched from loop()'s task. Cheap when there is nothing to do.
+void cloudLinkLoop();
+
+// A phone was registered (removed = false) or deleted on the local web page.
+// From loop()'s task, after the change has been saved.
+void cloudLinkPhoneChanged(const char *phoneId, const char *owner, bool removed);

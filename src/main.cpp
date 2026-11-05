@@ -3043,8 +3043,12 @@ void loop() {
     }
   }
 
-  if (cloudLinkRunning()) publishCloudStatus();
-  else ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
+  if (cloudLinkRunning()) {
+    publishCloudStatus();
+    cloudLinkLoop(); // phone list changes from the web app: devices[] is only changed here
+  } else {
+    ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
+  }
 
   handleWiFi(); // does nothing in AP mode
   webServer.handleClient();

@@ -2,8 +2,68 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <ArduinoJson.h>
 
 namespace {
+
+// Length of the valid UTF-8 sequence at `s`, or 0 if the byte there does not
+// start one (a stray continuation byte, an overlong form, a surrogate, past
+// U+10FFFF, or a sequence cut short).
+size_t utf8SeqLen(const unsigned char *s) {
+  unsigned char c = s[0];
+  if (c < 0x80) return 1;
+  size_t n;
+  unsigned long cp;
+  if (c >= 0xC2 && c <= 0xDF) {
+    n = 2;
+    cp = c & 0x1F;
+  } else if (c >= 0xE0 && c <= 0xEF) {
+    n = 3;
+    cp = c & 0x0F;
+  } else if (c >= 0xF0 && c <= 0xF4) {
+    n = 4;
+    cp = c & 0x07;
+  } else {
+    return 0;
+  }
+  for (size_t i = 1; i < n; i++) {
+    if ((s[i] & 0xC0) != 0x80) return 0;
+    cp = (cp << 6) | (s[i] & 0x3F);
+  }
+  if ((n == 3 && cp < 0x800) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF))) return 0;
+  if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+  return n;
+}
+
+// Copies `src` into `dst` (cap bytes), never cutting a UTF-8 sequence in two.
+void copyUtf8(char *dst, size_t cap, const char *src) {
+  if (cap == 0) return;
+  size_t len = 0;
+  const unsigned char *s = reinterpret_cast<const unsigned char *>(src);
+  while (*s) {
+    size_t n = utf8SeqLen(s);
+    if (n == 0) n = 1;   // invalid byte: copied as is, JSON output replaces it
+    if (len + n >= cap) break;
+    memcpy(dst + len, s, n);
+    len += n;
+    s += n;
+  }
+  dst[len] = '\0';
+}
+
+bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+
+// `src` without leading/trailing ASCII whitespace, into `dst` (UTF-8 safe).
+void copyTrimmed(char *dst, size_t cap, const char *src) {
+  while (isSpace(*src)) src++;
+  size_t n = strlen(src);
+  while (n > 0 && isSpace(src[n - 1])) n--;
+  char tmp[PHONE_KEY_MAX + 1];
+  if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+  memcpy(tmp, src, n);
+  tmp[n] = '\0';
+  copyUtf8(dst, cap, tmp);
+}
 
 // Appends to a fixed buffer; once anything fails to fit, stays failed.
 struct Out {
@@ -40,6 +100,43 @@ struct Out {
       }
       raw(tmp);
     }
+  }
+
+  // A JSON string body that keeps valid UTF-8 (names, phone ids and RTDB keys
+  // must arrive exactly as they are). Invalid bytes become '?'.
+  void utf8(const char *s) {
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
+    while (*p) {
+      size_t n = utf8SeqLen(p);
+      if (n > 1) {
+        char tmp[5];
+        memcpy(tmp, p, n);
+        tmp[n] = '\0';
+        raw(tmp);
+        p += n;
+        continue;
+      }
+      char one[2] = {n == 0 ? '?' : (char)*p, '\0'};
+      str(one);   // ASCII: escaped as usual
+      p++;
+    }
+  }
+
+  // "key/sub": a multi-path PATCH field name below an RTDB child key.
+  void pathField(const char *key, const char *sub) {
+    raw("\"");
+    utf8(key);
+    if (sub) {
+      raw("/");
+      raw(sub);
+    }
+    raw("\":");
+  }
+
+  void utf8Value(const char *v) {
+    raw("\"");
+    utf8(v);
+    raw("\"");
   }
 
   void field(const char *name) {
@@ -281,9 +378,51 @@ bool cloudParseDbHost(const char *url, char *host, size_t cap) {
 }
 
 size_t cloudBuildDevicePath(char *out, size_t cap, const char *deviceId, const char *secret) {
+  return cloudBuildDbPath(out, cap, deviceId, "", "", secret);
+}
+
+size_t cloudBuildDbPath(char *out, size_t cap, const char *deviceId, const char *child, const char *query,
+                        const char *secret) {
+  if (cap == 0) return 0;
+  out[0] = '\0';
   if (!cloudValidDeviceId(deviceId) || !cloudValidDbSecret(secret)) return 0;
-  int n = snprintf(out, cap, "/devices/%s.json?auth=%s", deviceId, secret);
-  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+  bool hasChild = child && child[0];
+  bool hasQuery = query && query[0];
+  int n = snprintf(out, cap, "/devices/%s%s%s.json?%s%sauth=%s", deviceId, hasChild ? "/" : "", hasChild ? child : "",
+                   hasQuery ? query : "", hasQuery ? "&" : "", secret);
+  if (n > 0 && (size_t)n < cap) return (size_t)n;
+  memset(out, 0, cap);   // a cut-off path still held part of the secret
+  return 0;
+}
+
+size_t cloudUrlEncode(const char *in, char *out, size_t cap) {
+  static const char kHexDigits[] = "0123456789ABCDEF";
+  if (cap == 0) return 0;
+  size_t len = 0;
+  for (const unsigned char *p = reinterpret_cast<const unsigned char *>(in); *p; p++) {
+    unsigned char c = *p;
+    bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                 c == '.' || c == '~';
+    size_t need = plain ? 1 : 3;
+    if (len + need >= cap) {
+      out[0] = '\0';
+      return 0;
+    }
+    if (plain) {
+      out[len++] = (char)c;
+    } else {
+      out[len++] = '%';
+      out[len++] = kHexDigits[c >> 4];
+      out[len++] = kHexDigits[c & 0x0F];
+    }
+  }
+  out[len] = '\0';
+  return len;
+}
+
+const char *cloudHttpBody(const char *resp) {
+  const char *p = strstr(resp, "\r\n\r\n");
+  return p ? p + 4 : nullptr;
 }
 
 size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned heartbeatIntervalS,
@@ -326,4 +465,257 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.plainString("bleUser", s.bleUser);
   o.raw("}}");
   return o.ok ? o.len : 0;
+}
+
+// ---------------- phone list sync ----------------
+
+bool cloudPhoneKey(const char *phoneId, char *out, size_t cap) {
+  if (cap == 0) return false;
+  out[0] = '\0';
+  while (isSpace(*phoneId)) phoneId++;
+  size_t n = strlen(phoneId);
+  while (n > 0 && isSpace(phoneId[n - 1])) n--;
+  if (n == 0 || n >= cap) return false;
+
+  const unsigned char *s = reinterpret_cast<const unsigned char *>(phoneId);
+  size_t i = 0;
+  while (i < n) {
+    size_t seq = utf8SeqLen(s + i);
+    if (seq > 1 && i + seq <= n) {
+      memcpy(out + i, s + i, seq);
+      i += seq;
+      continue;
+    }
+    unsigned char c = s[i];
+    bool bad = seq == 0 || seq > 1 || c < 0x20 || c == 0x7F || c == '.' || c == '$' || c == '#' || c == '[' ||
+               c == ']' || c == '/';
+    out[i++] = bad ? '_' : (char)c;
+  }
+  out[n] = '\0';
+  return true;
+}
+
+// The value of a key the Realtime Database treats as a 32-bit integer: the
+// client SDKs' rule, /^-?(0*)\d{1,10}$/ and inside the int32 range.
+static bool rtdbIntKey(const char *s, long long &v) {
+  const char *p = s;
+  bool neg = *p == '-';
+  if (neg) p++;
+  if (!*p) return false;
+  while (*p == '0' && p[1] >= '0' && p[1] <= '9') p++;   // leading zeros, keeping one digit
+  size_t digits = 0;
+  long long val = 0;
+  for (; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    if (++digits > 10) return false;
+    val = val * 10 + (*p - '0');
+  }
+  if (digits == 0) return false;
+  if (neg) val = -val;
+  if (val < -2147483648LL || val > 2147483647LL) return false;
+  v = val;
+  return true;
+}
+
+int cloudRtdbKeyCompare(const char *a, const char *b) {
+  long long ia = 0, ib = 0;
+  bool aInt = rtdbIntKey(a, ia);
+  bool bInt = rtdbIntKey(b, ib);
+  if (aInt && bInt) {
+    if (ia != ib) return ia < ib ? -1 : 1;
+    size_t la = strlen(a), lb = strlen(b);   // "007" after "7", as the SDKs order them
+    return la == lb ? 0 : (la < lb ? -1 : 1);
+  }
+  if (aInt != bInt) return aInt ? -1 : 1;
+  int c = strcmp(a, b);
+  return c == 0 ? 0 : (c < 0 ? -1 : 1);
+}
+
+static void rejectOp(PhoneOp &op, const char *reason) {
+  op.outcome = PHONE_REJECTED;
+  strncpy(op.reason, reason, sizeof(op.reason) - 1);
+  op.reason[sizeof(op.reason) - 1] = '\0';
+}
+
+static const char *jsonStr(JsonVariantConst v) {
+  const char *s = v.as<const char *>();
+  return s ? s : "";
+}
+
+bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, int maxOps, PhoneQueuePage &page) {
+  memset(&page, 0, sizeof(page));
+  if (!body) return false;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;   // IncompleteInput: the reply did not fit
+  page.parsed = true;
+  if (doc.isNull()) return true;                  // "null": the queue is empty
+  if (!doc.is<JsonObjectConst>()) {
+    page.parsed = false;
+    return false;
+  }
+
+  for (JsonPairConst kv : doc.as<JsonObjectConst>()) {
+    const char *key = kv.key().c_str();
+    page.keys++;
+    if (strlen(key) > (size_t)PHONE_KEY_MAX) {
+      page.keyTooLong = true;
+      continue;
+    }
+    if (!page.haveLast || cloudRtdbKeyCompare(key, page.lastKey) > 0) {
+      strcpy(page.lastKey, key);
+      page.haveLast = true;
+    }
+    if (skipKey && strcmp(key, skipKey) == 0) continue;
+
+    JsonVariantConst v = kv.value();
+    if (strcmp(jsonStr(v["status"]), "rejected") == 0) continue;   // waits for the web app to queue it again
+    if (page.ops >= maxOps) continue;
+
+    PhoneOp &op = ops[page.ops++];
+    memset(&op, 0, sizeof(op));
+    strcpy(op.key, key);
+    op.outcome = PHONE_PENDING;
+
+    // The exact id the phone sends at login; the key only when the entry has none.
+    const char *rawId = jsonStr(v["phoneId"]);
+    if (!rawId[0]) rawId = key;
+    char id[PHONE_KEY_MAX + 1];
+    copyTrimmed(id, sizeof(id), rawId);
+
+    const char *action = jsonStr(v["action"]);
+    if (strcmp(action, "remove") == 0) {
+      op.action = PHONE_REMOVE;
+    } else if (action[0] == '\0' || strcmp(action, "add") == 0) {
+      op.action = PHONE_ADD;
+    } else {
+      rejectOp(op, "Unknown action");
+      continue;
+    }
+
+    if (!id[0]) {
+      rejectOp(op, "Phone ID missing");
+      continue;
+    }
+    if (strlen(id) > (size_t)PHONE_ID_MAX) {
+      rejectOp(op, "Phone ID longer than 40 characters");
+      continue;
+    }
+    strcpy(op.phoneId, id);
+
+    // The PLC keeps one owner field, shown as "Owner email" on its page.
+    const char *email = jsonStr(v["ownerEmail"]);
+    const char *name  = jsonStr(v["owner"]);
+    char owner[sizeof(op.owner)];
+    copyTrimmed(owner, sizeof(owner), email);
+    if (!owner[0]) copyTrimmed(owner, sizeof(owner), name);
+    strcpy(op.owner, owner);
+  }
+  return true;
+}
+
+size_t cloudBuildQueueResult(char *out, size_t cap, const PhoneOp *ops, int n, int &written) {
+  written = 0;
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  for (int i = 0; i < n; i++) {
+    const PhoneOp &op = ops[i];
+    if (op.outcome == PHONE_PENDING) continue;
+    if (written > 0) o.raw(",");
+    if (op.outcome == PHONE_REJECTED) {
+      o.pathField(op.key, "status");
+      o.raw("\"rejected\",");
+      o.pathField(op.key, "reason");
+      o.utf8Value(op.reason);
+    } else {
+      o.pathField(op.key, nullptr);
+      o.raw("null");
+    }
+    written++;
+  }
+  o.raw("}");
+  if (!o.ok) {
+    written = 0;
+    return 0;
+  }
+  return o.len;
+}
+
+size_t cloudBuildPhonelistPatch(char *out, size_t cap, const PhoneOp *ops, int n) {
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  for (int i = 0; i < n; i++) {
+    const PhoneOp &op = ops[i];
+    if (i > 0) o.raw(",");
+    if (op.action == PHONE_REMOVE) {
+      o.pathField(op.key, nullptr);
+      o.raw("null");
+      continue;
+    }
+    o.pathField(op.key, "phoneId");
+    o.utf8Value(op.phoneId);
+    if (op.owner[0]) {
+      o.raw(",");
+      o.pathField(op.key, strchr(op.owner, '@') ? "ownerEmail" : "owner");
+      o.utf8Value(op.owner);
+    }
+    o.raw(",");
+    o.pathField(op.key, "source");
+    o.raw("\"plc\",");
+    o.pathField(op.key, "registeredAt");
+    o.raw("{\".sv\":\"timestamp\"}");
+  }
+  o.raw("}");
+  return o.ok ? o.len : 0;
+}
+
+bool cloudShallowHasKeys(const char *body, const char (*keys)[PHONE_ID_MAX + 1], int n, bool *present) {
+  for (int i = 0; i < n; i++) present[i] = false;
+  if (!body) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;
+  if (doc.isNull()) return true;   // no phones on the web yet
+  if (!doc.is<JsonObjectConst>()) return false;
+  JsonObjectConst obj = doc.as<JsonObjectConst>();
+  for (int i = 0; i < n; i++) present[i] = !obj[keys[i]].isNull();
+  return true;
+}
+
+size_t cloudBuildPhoneSyncRecord(char *out, size_t cap, const char *deviceId, const char *ts, const char *status,
+                                 const PhoneSyncCounts &c) {
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  o.plainString("type", "phones");
+  o.raw(",");
+  o.plainString("status", status);
+  o.raw(",");
+  o.plainUint("entries", (unsigned long)c.entries);
+  o.raw(",");
+  o.plainUint("added", (unsigned long)c.added);
+  o.raw(",");
+  o.plainUint("updated", (unsigned long)c.updated);
+  o.raw(",");
+  o.plainUint("removed", (unsigned long)c.removed);
+  o.raw(",");
+  o.plainUint("rejected", (unsigned long)c.rejected);
+  o.raw(",");
+  o.plainString("ts", ts);
+  o.raw(",");
+  o.plainString("deviceId", deviceId);
+  o.raw("}");
+  return o.ok ? o.len : 0;
+}
+
+void cloudHistoryKey(const char *ts, unsigned long uptimeS, char *out, size_t cap) {
+  if (cap == 0) return;
+  if (!ts || !ts[0]) {
+    snprintf(out, cap, "uptime-%lu", uptimeS);
+    return;
+  }
+  size_t i = 0;
+  for (; ts[i] && i + 1 < cap; i++) {
+    char c = ts[i];
+    out[i] = c == ':' ? '-' : (c == ' ' ? '_' : c);
+  }
+  out[i] = '\0';
 }

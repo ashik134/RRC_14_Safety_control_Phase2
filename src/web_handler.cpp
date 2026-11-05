@@ -92,19 +92,125 @@ void loadDevices()
   prefs.end();
 }
 
-void saveDevices()
+bool saveDevices()
 {
-  prefs.begin("devices", false);
-  prefs.putInt("count", deviceCount);
+  if (!prefs.begin("devices", false))
+    return false;
+  bool ok = prefs.putInt("count", deviceCount) == sizeof(int32_t);
   for (int i = 0; i < deviceCount; i++)
   {
     char idkey[16], okey[16];
     sprintf(idkey, "dev_%d", i);
     sprintf(okey, "owner_%d", i);
-    prefs.putString(idkey, devices[i].id);
-    prefs.putString(okey, devices[i].owner);
+    // putString() returns the length it stored (0 on error, and for "").
+    ok = prefs.putString(idkey, devices[i].id) == strlen(devices[i].id) && ok;
+    ok = prefs.putString(okey, devices[i].owner) == strlen(devices[i].owner) && ok;
   }
   prefs.end();
+  return ok;
+}
+
+static int findDeviceIndex(const char *id)
+{
+  for (int i = 0; i < deviceCount; i++)
+  {
+    if (strcmp(devices[i].id, id) == 0)
+      return i;
+  }
+  return -1;
+}
+
+void applyCloudPhoneOps(PhoneOp *ops, int n)
+{
+  // Kept so a registry that cannot be stored is put back exactly as it was:
+  // the web app then still shows the change as waiting, and it is retried.
+  Device *backup = static_cast<Device *>(malloc(sizeof(devices)));
+  if (!backup)
+  {
+    Serial.println("[PHONESYNC] No memory to apply phone changes; retried later");
+    return; // every op stays PHONE_PENDING
+  }
+  memcpy(backup, devices, sizeof(devices));
+  int backupCount = deviceCount;
+
+  bool changed = false;
+  uint32_t decidedHere = 0; // ops this call gave an outcome (n is a page: at most 32)
+  for (int i = 0; i < n && i < 32; i++)
+  {
+    PhoneOp &op = ops[i];
+    if (op.outcome != PHONE_PENDING)
+      continue;
+    decidedHere |= 1UL << i;
+    int idx = findDeviceIndex(op.phoneId);
+    if (op.action == PHONE_REMOVE)
+    {
+      if (idx < 0)
+      {
+        op.outcome = PHONE_ABSENT;
+        continue;
+      }
+      for (int j = idx; j < deviceCount - 1; j++)
+        devices[j] = devices[j + 1];
+      deviceCount--;
+      memset(&devices[deviceCount], 0, sizeof(Device));
+      op.outcome = PHONE_REMOVED;
+      changed = true;
+      continue;
+    }
+    if (idx >= 0)
+    {
+      if (strcmp(devices[idx].owner, op.owner) == 0)
+      {
+        op.outcome = PHONE_UNCHANGED;
+        continue;
+      }
+      strlcpy(devices[idx].owner, op.owner, sizeof(devices[idx].owner));
+      op.outcome = PHONE_UPDATED;
+      changed = true;
+      continue;
+    }
+    if (deviceCount >= MAX_DEVICES)
+    {
+      op.outcome = PHONE_REJECTED;
+      snprintf(op.reason, sizeof(op.reason), "Phone list full (%d of %d)", deviceCount, MAX_DEVICES);
+      continue;
+    }
+    memset(&devices[deviceCount], 0, sizeof(Device));
+    strlcpy(devices[deviceCount].id, op.phoneId, sizeof(devices[deviceCount].id));
+    strlcpy(devices[deviceCount].owner, op.owner, sizeof(devices[deviceCount].owner));
+    deviceCount++;
+    op.outcome = PHONE_ADDED;
+    changed = true;
+  }
+
+  if (changed && !saveDevices())
+  {
+    Serial.println("[PHONESYNC] Could not save the device registry; changes undone, retried later");
+    memcpy(devices, backup, sizeof(devices));
+    deviceCount = backupCount;
+    saveDevices(); // best effort: put storage back in step with what is in use
+    // Every decision of this call is withdrawn, rejections included: "list
+    // full" may not hold once the batch is retried.
+    for (int i = 0; i < n && i < 32; i++)
+    {
+      if (decidedHere & (1UL << i))
+      {
+        ops[i].outcome = PHONE_PENDING;
+        ops[i].reason[0] = '\0';
+      }
+    }
+  }
+  else if (changed)
+  {
+    for (int i = 0; i < n && i < 32; i++)
+    {
+      const PhoneOp &op = ops[i];
+      if (op.outcome == PHONE_ADDED || op.outcome == PHONE_UPDATED || op.outcome == PHONE_REMOVED)
+        Serial.printf("[PHONESYNC] %s %s (from the web app)\n",
+                      op.outcome == PHONE_ADDED ? "Registered" : (op.outcome == PHONE_UPDATED ? "Updated" : "Removed"), op.phoneId);
+    }
+  }
+  free(backup);
 }
 
 bool isDeviceRegistered(const char *id)
@@ -1937,7 +2043,7 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
     cloudLinkGetFirebase(fbCfg, fb);
     memset(fbCfg.secret, 0, sizeof(fbCfg.secret)); // only fb.hasSecret is used below
     html += "<div id='tab-firebase' class='page page-narrow'>";
-    html += panelHead("cloud", "Firebase", "Sends this PLC's heartbeat and status to the BLE Face Access device record in the online web app. Crane control does not depend on it.");
+    html += panelHead("cloud", "Firebase", "Sends this PLC's heartbeat and status to the BLE Face Access device record in the online web app, and keeps the Device Registry in step with its phone list. Crane control does not depend on it.");
     if (webServer.hasArg("saved"))
       html += alertHtml("success", "Saved. The PLC will try to connect within a few seconds.");
     html += "<div class='card'><dl class='kv'>";
@@ -1947,6 +2053,8 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
     html += kvItem("Database secret", fb.hasSecret ? String("Saved") : String("&mdash;"));
     html += kvItem("Last push", fb.everOk ? String((unsigned long)fb.lastOkAgoS) + " s ago" : String("None since boot"));
     html += kvItem("Pushes sent / failed", String((unsigned long)fb.okCount) + " / " + String((unsigned long)fb.failCount));
+    html += kvItem("Phone sync", htmlEsc(String(fb.phoneState)));
+    html += kvItem("Last phone sync check", fb.phoneEverOk ? String((unsigned long)fb.phoneLastOkAgoS) + " s ago" : String("None since boot"));
     html += "</dl></div>";
     html += "<div class='card'>";
     html += "<form method='POST' action='/firebase'>";
@@ -2440,6 +2548,8 @@ static void handleDevicesPost()
   owner.toCharArray(devices[deviceCount].owner, sizeof(devices[deviceCount].owner));
   deviceCount++;
   saveDevices();
+  // Shown in the web app's phone list too (source "plc").
+  cloudLinkPhoneChanged(devices[deviceCount - 1].id, devices[deviceCount - 1].owner, false);
   webServer.sendHeader("Location", "/?tab=devices");
   sendSafe(303);
 }
@@ -2580,12 +2690,16 @@ static void handleDeleteDevicePost()
     sendSafe(404, "text/html", errorPage("Device not found.", "/?tab=devices"));
     return;
   }
+  char removedId[sizeof(devices[0].id)];
+  strlcpy(removedId, devices[idx].id, sizeof(removedId));
   for (int i = idx; i < deviceCount - 1; i++)
   {
     devices[i] = devices[i + 1];
   }
   deviceCount--;
   saveDevices();
+  // Taken out of the web app's phone list too.
+  cloudLinkPhoneChanged(removedId, "", true);
   webServer.sendHeader("Location", "/?tab=devices");
   sendSafe(303);
 }

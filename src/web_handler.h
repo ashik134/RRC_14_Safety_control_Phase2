@@ -130,10 +130,16 @@ void setupWebRoutes();
 extern Device devices[MAX_DEVICES];
 extern int deviceCount;
 void loadDevices();
-void saveDevices();
+bool saveDevices();   // false if NVS did not take every value
 bool isDeviceRegistered(const char* id);
 bool registerDevice(const char* id, const char* owner);
 bool unregisterDevice(const char* id);
+
+// Applies phone changes from the web app (cloud_link.cpp, on loop()'s task).
+// Each op with outcome PHONE_PENDING gets its outcome; if the registry cannot
+// be saved it is left as it was and the ops stay PHONE_PENDING.
+struct PhoneOp;
+void applyCloudPhoneOps(PhoneOp* ops, int n);
 
 // Motion helpers
 const char* getMotionLabel(uint8_t motionId);
