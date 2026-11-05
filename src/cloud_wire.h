@@ -11,6 +11,8 @@
 struct CloudStatus {
   char     ip[16];
   uint32_t uptimeS;
+  uint32_t freeHeap;      // bytes, at the moment of the push (network task)
+  uint32_t minFreeHeap;   // lowest since boot
   char     rtc[20];       // "YYYY-MM-DD HH:MM:SS", empty when the clock is unset
   bool     rtcOk;
   bool     sdOk;
@@ -19,6 +21,10 @@ struct CloudStatus {
   bool     bleConn;
   bool     bleAuth;
   char     bleUser[64];
+  // Network settings in use (the web app's Network Settings form shows them).
+  char     bleName[32];
+  char     wifiSsid[32];
+  bool     netRestartPending;   // new settings saved, applied at the next idle restart
 };
 
 // Both return the length written, or 0 if it did not fit in `cap`.
@@ -75,37 +81,73 @@ size_t cloudUrlEncode(const char *in, char *out, size_t cap);
 // The body of an HTTP reply (after the blank line), or nullptr if there is none.
 const char *cloudHttpBody(const char *resp);
 
-// ---- Phone list sync with the web app (BLE Face Access section) ----
-// The web app keeps the phones in devices/{deviceId}/phonelist/{key} and queues
-// changes for the PLC in devices/{deviceId}/tobesyncedphoneid/{key}, with
+// The JSON for a PATCH of `devices/{deviceId}`: the heartbeat (PLC-local time, as
+// the web app's online indicator reads it), its interval, the live status and
+// the network settings in use. `heartbeat` is left out while the PLC's clock is
+// unset, so the device shows as offline instead of fresh. 0 if it did not fit.
+size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned heartbeatIntervalS,
+                              const CloudStatus &s);
+
+// ---- Sync with the web app (BLE Face Access section) ----
+// The web app queues changes for the PLC below devices/{deviceId}, with
 // devices/{deviceId}/tobesynced = true as the wake-up flag (same as the MA
-// devices). An entry is {phoneId, phoneModel, owner?, ownerEmail?, queuedAt}, or
-// {phoneId, action: "remove", queuedAt}. The PLC deletes an entry once it has
-// applied it, or marks it {status: "rejected", reason}.
+// devices). The PLC deletes a queue entry once it has applied it, or marks it
+// {status: "rejected", reason}.
+//
+//   tobesyncedphoneid/{key}  {phoneId, phoneModel, owner?, ownerEmail?, queuedAt}
+//                            | {phoneId, action: "remove", queuedAt}
+//   tobesyncedusers/{key}    {email, name, role, accessType, startTs, endTs,
+//                             passwordHash?, renameFrom?, queuedAt}
+//                            | {email, action: "remove", queuedAt}
+//   tobesyncednetwork        {bleName, ssid, wifiPassword?, queuedAt}
+//
+// and the PLC mirrors what it holds into phonelist/{key} and userlist/{key}.
 
 static const int PHONE_ID_MAX  = 40;    // Device::id in web_handler.h
-static const int PHONE_KEY_MAX = 127;   // longest queue key the PLC can address
+static const int QUEUE_KEY_MAX = 127;   // longest queue key the PLC can address
+static const int PHONE_KEY_MAX = QUEUE_KEY_MAX;
 
-enum PhoneAction : uint8_t { PHONE_ADD = 0, PHONE_REMOVE = 1 };
+enum QueueAction : uint8_t { OP_ADD = 0, OP_REMOVE = 1 };
 
-// What applying one entry did. PENDING = not applied (yet): the entry stays.
-enum PhoneOutcome : uint8_t {
-  PHONE_PENDING = 0,
-  PHONE_ADDED,      // new on the PLC
-  PHONE_UPDATED,    // already there, owner changed
-  PHONE_UNCHANGED,  // already there, nothing to change
-  PHONE_REMOVED,
-  PHONE_ABSENT,     // removal of a phone the PLC did not have
-  PHONE_REJECTED,   // see `reason`; the entry stays, marked rejected
+// What applying one entry did. OP_PENDING = not applied (yet): the entry stays.
+enum QueueOutcome : uint8_t {
+  OP_PENDING = 0,
+  OP_ADDED,      // new on the PLC
+  OP_UPDATED,    // already there, changed
+  OP_UNCHANGED,  // already there, nothing to change
+  OP_REMOVED,
+  OP_ABSENT,     // removal of something the PLC did not have
+  OP_REJECTED,   // see `reason`; the entry stays, marked rejected
+};
+
+// Common head of every queue op: the RTDB key and what became of the entry.
+struct QueueOpHead {
+  char    key[QUEUE_KEY_MAX + 1];
+  uint8_t action;    // QueueAction
+  uint8_t outcome;   // QueueOutcome
+  char    reason[48];
 };
 
 struct PhoneOp {
-  char    key[PHONE_KEY_MAX + 1];   // the RTDB child key
-  char    phoneId[PHONE_ID_MAX + 1];
-  char    owner[64];                // Device::owner: the owner email, else the owner name
-  uint8_t action;                   // PhoneAction
-  uint8_t outcome;                  // PhoneOutcome
-  char    reason[48];               // with PHONE_REJECTED
+  QueueOpHead h;
+  char        phoneId[PHONE_ID_MAX + 1];
+  char        owner[64];   // Device::owner: the owner email, else the owner name
+};
+
+// User fields, as in User (web_handler.h).
+static const int USER_NAME_MAX  = 32;
+static const int USER_EMAIL_MAX = 40;
+static const int USER_HASH_LEN  = 53;   // "$p1$" + 16 + "$" + 32, see password_hash.h
+
+struct UserOp {
+  QueueOpHead h;
+  char        email[64];
+  char        name[64];
+  char        role[16];            // "Admin" | "Operator"
+  uint8_t     accessType;          // ACCESS_PERPETUAL (0) | ACCESS_TIMED (1)
+  uint32_t    startTs, endTs;      // timed only: PLC wall-clock seconds
+  char        passwordHash[64];    // "" = keep the current password
+  char        renameFrom[64];      // "" = not a rename; else the user's current email
 };
 
 // The RTDB key of a phone id, exactly as the web app's BfaPhone.keyFor():
@@ -113,60 +155,80 @@ struct PhoneOp {
 // invalid UTF-8 bytes, which no key may hold). False if empty or too long.
 bool cloudPhoneKey(const char *phoneId, char *out, size_t cap);
 
+// The RTDB key of a user, exactly as the web app's BfaUser.keyFor(): the email
+// trimmed and ASCII-lower-cased, with % . $ # [ ] / control characters, DEL and
+// invalid UTF-8 bytes written as %XX (so distinct emails never share a key).
+// False if empty or too long.
+bool cloudUserKey(const char *email, char *out, size_t cap);
+
 // Realtime Database key order for orderBy="$key": keys that are 32-bit
 // integers first, by value, then the rest by byte order. <0, 0 or >0.
 int cloudRtdbKeyCompare(const char *a, const char *b);
 
-struct PhoneQueuePage {
+struct QueuePage {
   bool parsed;                       // false: not JSON, or cut off (reply too big)
   int  keys;                         // children in the reply, `skipKey` included
   int  ops;                          // entries put in `ops`
   bool haveLast;
-  bool keyTooLong;                   // a key longer than PHONE_KEY_MAX was skipped
-  char lastKey[PHONE_KEY_MAX + 1];   // greatest key in the reply, for the next page
+  bool keyTooLong;                   // a key longer than QUEUE_KEY_MAX was skipped
+  char lastKey[QUEUE_KEY_MAX + 1];   // greatest key in the reply, for the next page
 };
+typedef QueuePage PhoneQueuePage;
 
-// Parses one page of tobesyncedphoneid. Entries already marked rejected, and
-// `skipKey` (the previous page's last key, as startAt includes it), are left
-// out. An entry the PLC cannot take is returned with outcome PHONE_REJECTED and
-// a reason; the others are PHONE_PENDING. False if `page.parsed` is false.
-bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, int maxOps, PhoneQueuePage &page);
+// Parse one page of a queue. Entries already marked rejected, and `skipKey`
+// (the previous page's last key, as startAt includes it), are left out. An
+// entry the PLC cannot take is returned with outcome OP_REJECTED and a
+// reason; the others are OP_PENDING. False if `page.parsed` is false.
+bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, int maxOps, QueuePage &page);
+bool cloudParseUserQueue(const char *body, const char *skipKey, UserOp *ops, int maxOps, QueuePage &page);
 
-// The PATCH of tobesyncedphoneid that confirms `ops`: applied entries are
-// deleted, rejected ones get status and reason, pending ones are left alone.
-// `written` is how many entries it covers (0: nothing to send). 0 if it did not fit.
-size_t cloudBuildQueueResult(char *out, size_t cap, const PhoneOp *ops, int n, int &written);
+// The PATCH of a queue that confirms `n` ops (each `stride` bytes apart,
+// starting with a QueueOpHead): applied entries are deleted, rejected ones get
+// status and reason, pending ones are left alone. `written` is how many entries
+// it covers (0: nothing to send). 0 if it did not fit.
+size_t cloudBuildQueueResult(char *out, size_t cap, const void *ops, size_t stride, int n, int &written);
 
-// The PATCH of phonelist for phones registered (PHONE_ADD) or deleted
-// (PHONE_REMOVE) on the PLC's own web page. Adds write single fields, so a
-// model or name the web app keeps is not lost. Keys must all differ. 0 if it
-// did not fit.
+// The PATCH of phonelist for phones registered (OP_ADD) or deleted
+// (OP_REMOVE) on the PLC. Adds write single fields, so a model or name the web
+// app keeps is not lost. Keys must all differ. 0 if it did not fit.
 size_t cloudBuildPhonelistPatch(char *out, size_t cap, const PhoneOp *ops, int n);
 
-// For a reply to GET phonelist.json?shallow=true: sets present[i] when keys[i]
-// is in it. False if the reply is not complete JSON.
-bool cloudShallowHasKeys(const char *body, const char (*keys)[PHONE_ID_MAX + 1], int n, bool *present);
+// The PATCH of userlist: OP_ADD writes the whole record (never a password),
+// OP_REMOVE deletes it. Keys must all differ. 0 if it did not fit.
+size_t cloudBuildUserlistPatch(char *out, size_t cap, const UserOp *ops, int n);
 
-struct PhoneSyncCounts {
-  int entries;    // queue entries confirmed (all outcomes but PENDING)
+// A PATCH that deletes `n` children of a node, by key. 0 if it did not fit.
+size_t cloudBuildDeleteKeys(char *out, size_t cap, const char *const *keys, int n);
+
+// Network settings queued by the web app. `present` false: nothing queued.
+struct NetworkRequest {
+  bool present;
+  bool rejected;          // already marked rejected: waits for a new request
+  bool valid;
+  char reason[48];        // when !valid
+  char bleName[32];
+  char ssid[32];
+  char wifiPassword[64];  // "" = keep the current one
+};
+// Parses GET tobesyncednetwork.json and checks it against the PLC's rules
+// (BLE name "RRC_" + 5-10 characters, SSID 5-10, Wi-Fi password 8-10). False
+// if the reply is not complete JSON.
+bool cloudParseNetworkRequest(const char *body, NetworkRequest &req);
+
+struct SyncCounts {
+  int entries;    // queue entries confirmed (all outcomes but OP_PENDING)
   int added;
   int updated;
   int removed;    // removed, or already absent
   int rejected;
 };
+typedef SyncCounts PhoneSyncCounts;
 
 // The synchistory record of one sync run (the web app reads status, entries
-// and ts). 0 if it did not fit.
-size_t cloudBuildPhoneSyncRecord(char *out, size_t cap, const char *deviceId, const char *ts, const char *status,
-                                 const PhoneSyncCounts &c);
+// and ts). `type` is "phones", "users" or "network". 0 if it did not fit.
+size_t cloudBuildSyncRecord(char *out, size_t cap, const char *type, const char *deviceId, const char *ts,
+                            const char *status, const SyncCounts &c);
 
 // synchistory key: "YYYY-MM-DD_HH-MM-SS" from the PLC time, or "uptime-N"
 // while the clock is unset (the MA devices use the same keys).
 void cloudHistoryKey(const char *ts, unsigned long uptimeS, char *out, size_t cap);
-
-// The JSON for a PATCH of `devices/{deviceId}`: the heartbeat (PLC-local time, as
-// the web app's online indicator reads it), its interval and the live status.
-// `heartbeat` is left out while the PLC's clock is unset, so the device shows as
-// offline instead of fresh. 0 if it did not fit.
-size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned heartbeatIntervalS,
-                              const CloudStatus &s);

@@ -21,6 +21,7 @@ struct User {
   uint8_t  accessType; // ACCESS_PERPETUAL or ACCESS_TIMED
   uint32_t startTs;    // Timed only: access starts at this date/time (seconds since 1970, in RTC time)
   uint32_t endTs;      // Timed only: access ends at this date/time (exclusive)
+  char empId[17];      // employee ID, "" = none (set from the mobile app; blep::validEmpId)
 };
 
 // User access type: perpetual users may log in at any time; timed users only
@@ -135,11 +136,21 @@ bool isDeviceRegistered(const char* id);
 bool registerDevice(const char* id, const char* owner);
 bool unregisterDevice(const char* id);
 
-// Applies phone changes from the web app (cloud_link.cpp, on loop()'s task).
-// Each op with outcome PHONE_PENDING gets its outcome; if the registry cannot
-// be saved it is left as it was and the ops stay PHONE_PENDING.
+// Apply changes from the web app (cloud_link.cpp, on loop()'s task). Each op
+// with outcome OP_PENDING gets its outcome; if the list cannot be saved it is
+// left as it was and the ops stay OP_PENDING. A user change that would leave
+// the PLC without an Admin is rejected.
 struct PhoneOp;
+struct UserOp;
 void applyCloudPhoneOps(PhoneOp* ops, int n);
+void applyCloudUserOps(UserOp* ops, int n);
+
+// Network settings from the web app: saved to NVS now, applied by the restart
+// that loop() makes once no phone has been connected for a while. 1 = saved
+// (restart pending), 0 = nothing to change, -1 = could not be saved.
+int stageCloudNetwork(const char* ble, const char* ssid, const char* wifiPass);
+extern volatile bool netRestartPending;
+extern volatile unsigned long netStagedAtMs;
 
 // Motion helpers
 const char* getMotionLabel(uint8_t motionId);

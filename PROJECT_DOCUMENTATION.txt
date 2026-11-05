@@ -360,6 +360,35 @@ Main features
    SD event log ("<name> (<email>) added as <role> by <admin email>").
    The new user's phone still has to be added in the Device Registry (web).
 
+   Operator Management (JSON only, see src/ble_protocol.h for the exact
+   messages). A signed-in Admin can list, change and remove OPERATORS; an
+   Admin account is never listed, changed or removed this way (FORBIDDEN),
+   and the role never changes.
+        user.list    -> one user.item per Operator (name, email, emp,
+                        access, from/to), then user.list ok + count.
+                        These replies are RAW encrypted bytes (IV|CIPHER|TAG),
+                        not hex, one per ~15 ms from loop(). An item is at most
+                        228 bytes: needs a peer MTU of item size + 31
+                        (MTU_TOO_SMALL otherwise). A name that would take an
+                        item over is cut and the item says "cut":true.
+                        CHANGED: the user list changed during the listing.
+        user.update  email = whom; optional name, newEmail, emp, password,
+                     access (+ from/to); only the fields sent change.
+        user.remove  email = whom.
+        Further reasons: NOT_FOUND, EMP_EXISTS, MTU_TOO_SMALL, ITEM_TOO_LONG.
+        A JSON request too long to write as hex (512-byte attribute) is
+        written as raw bytes; decodePayload() takes both.
+   loop() applies update/remove against the list as it is then, saves
+   (rolled back if saveUsers fails), logs USER_UPDATED / USER_REMOVED to the
+   SD event log and passes the change to the web app (cloudLinkUserChanged),
+   the same as a web-panel edit/delete. Nothing is applied once the Admin who
+   asked has disconnected.
+   Employee ID: optional, up to 16 of A-Z a-z 0-9 space . _ / - (not leading
+   or trailing space), unique among users when set. Stored as an 8th field
+   of the user record ("" for records written before it); set from the app
+   by user.add ("emp") or user.update. Not shown on the web panel or synced
+   to the web app.
+
  5.7 EVENT LOG characteristic (browse / download the SD event log)
    Characteristic: 6e400012-b5a3-f393-e0a9-e50e24dcca9e   WRITE + NOTIFY
    (in the user-management service 6e400010-..., which now has 12 handles)
@@ -819,7 +848,7 @@ Main features
  Namespace    Keys                                   Content
  -----------  -------------------------------------  -------------------------
  bleusers     count; u_i = one string per user       BLE/web users
-              (name,email,pass,role,acc,start,end
+              (name,email,password hash,role,acc,start,end
               joined by 0x1F; old email_i... keys migrate)
  outconfig    pin_i_function, pin_i_motion           Output mapping
  inconfig     mode_i, remote_in                      Input modes, interlock input
@@ -858,7 +887,11 @@ Main features
      https://<database host>/devices/<Device ID>.json?auth=<secret>
  with heartbeat (PLC-local "YYYY-MM-DD HH:MM:SS", left out while the clock is
  unset), heartbeatIntervalSec (60), fw, localIp and a status object (uptimeS,
- rtcOk, sdOk, estop, up, down, left, right, bleConn, bleAuth, bleUser). PATCH
+ freeHeap, minFreeHeap, rtcOk, sdOk, estop, up, down, left, right, bleConn,
+ bleAuth, bleUser). When a field the web app's Overview shows live changes
+ (motion, E-STOP, the BLE connection and user, SD, RTC, a pending network
+ restart), the same PATCH is sent early, at most once every 5 s, so the
+ Overview follows within a few seconds instead of up to a minute. PATCH
  only merges, so what the web app keeps under devices/<id> is never removed.
  All paths come from cloudBuildDevicePath(), so there is one place that uses
  the saved Device ID. It does not need CLOUD_PROJECT_ID, runs in the same task
@@ -867,58 +900,96 @@ Main features
  .firebasedatabase.app, and the certificate is always verified. The secret is
  never shown again after saving (leave the field blank to keep it).
 
- Phone list sync (same task, same settings, src/cloud_link.cpp). While the
- Firebase push is on, the Device Registry (devices[], the phones allowed to log
- in over BLE) is kept in step with the web app's BLE Face Access phone list,
- the same way the MA devices sync their readers. All paths are under
- devices/<Device ID>:
+ Sync with the web app (same task, same settings, src/cloud_link.cpp). While
+ the Firebase push is on, the Device Registry (devices[], the phones allowed to
+ log in over BLE), the users (users[]) and the network settings are kept in
+ step with the web app's BLE Face Access section, the same way the MA devices
+ sync their readers. All paths are under devices/<Device ID>:
 
-   tobesynced                 web app sets true whenever it queues something
-   tobesyncedphoneid/<key>    queue, web -> PLC:
-                                {phoneId, phoneModel, owner?, ownerEmail?, queuedAt}
-                                  = register the phone, or update its owner
-                                {phoneId, action:"remove", queuedAt}
-                                  = delete the phone
-   phonelist/<key>            the web app's list; the PLC writes the phones
-                              registered or deleted on its own Devices page
-                              (source "plc")
-   synchistory/<time>         one record per sync run that applied something:
-                                {type:"phones", status, entries, added, updated,
-                                 removed, rejected, ts, deviceId}
-                              status = success | partial (some rejected)
-                                     | incomplete (stopped early)
+   tobesynced                web app sets true whenever it queues something
+   tobesyncedphoneid/<key>   phones, web -> PLC:
+                               {phoneId, phoneModel, owner?, ownerEmail?, queuedAt}
+                                 = register the phone, or update its owner
+                               {phoneId, action:"remove", queuedAt} = delete it
+   tobesyncedusers/<key>     users, web -> PLC:
+                               {email, name, role, accessType, startTs, endTs,
+                                passwordHash?, renameFrom?, queuedAt}
+                                 = add the user, or update it (renameFrom: the
+                                   user's current email when the email changed)
+                               {email, action:"remove", queuedAt} = delete it
+   tobesyncednetwork         {bleName, ssid, wifiPassword?, queuedAt}
+   phonelist/<key>           the web app's phone list; the PLC writes its own
+   userlist/<key>            the web app's user list (never a password); the
+                             PLC writes the users it holds (source "plc")
+   network                   {bleName, ssid, restartPending}, with every heartbeat
+   synchistory/<time>-<type> one record per sync run that changed something:
+                               {type: phones | users | network, status, entries,
+                                added, updated, removed, rejected, ts, deviceId}
+                             status = success | partial (some rejected)
+                                    | incomplete (stopped early)
 
- <key> is the phone id trimmed, with . $ # [ ] / and control characters
- replaced by '_' (cloudPhoneKey(), the same rule as the web app's keyFor).
+ Keys: a phone's is its id trimmed, with . $ # [ ] / and control characters
+ replaced by '_' (cloudPhoneKey()); a user's is the email trimmed and
+ lower-cased, with % . $ # [ ] / and control characters written as %XX
+ (cloudUserKey()). The web app computes the same (BfaPhone.keyFor,
+ BfaUser.keyFor).
 
  Web -> PLC. Every 20 s the PLC reads tobesynced. When it is true the PLC sets
- it false and then reads the queue, 4 entries per request (orderBy="$key",
- paged with startAt). Each page is handed to loop(), which applies it to
- devices[] and saves the registry once (cloudLinkLoop() -> applyCloudPhoneOps()),
- so devices[] is still only changed on loop()'s task. The PLC then deletes the
- applied entries, or marks an entry {status:"rejected", reason} (registry full
- at 20, id missing or longer than 40 characters, unknown action). A rejected
- entry stays until the web app queues it again. Applying is idempotent:
- registering a phone the PLC has updates its owner, removing one it does not
- have succeeds. The owner stored is ownerEmail, else owner (the Devices page
- calls it "Owner email"). If the registry cannot be saved, the batch is undone
- and stays queued, and the run is retried after 30 s. A run that applied
- something is followed by one more, which picks up anything queued meanwhile.
- The queue is also read once after every boot and after the settings change.
+ it false and then reads the queues, a few entries per request (orderBy="$key",
+ paged with startAt). Each page is handed to loop(), which applies it and saves
+ the list once (cloudLinkLoop() -> applyCloudPhoneOps() / applyCloudUserOps()),
+ so devices[] and users[] are still only changed on loop()'s task. The PLC then
+ deletes the applied entries, or marks an entry {status:"rejected", reason}. A
+ rejected entry stays until the web app queues it again. Reasons include: list
+ full (20 phones, 30 users), a field missing or not valid, a new user without a
+ password, an email already used by another user, and any change that would
+ leave the PLC without an Admin (it would bring back admin@plc.com / admin123).
+ Applying is idempotent: adding what the PLC has updates it, removing what it
+ does not have succeeds. If the list cannot be saved, the batch is undone and
+ stays queued, and the run is retried after 30 s. A run that applied something
+ is followed by one more, which picks up anything queued meanwhile. The queues
+ are also read once after every boot and after the settings change.
 
- PLC -> web. A phone registered or deleted on the PLC's Devices page is written
- to phonelist (up to 4 changes wait in RAM while the network is down). After
- every boot the PLC also adds any of its phones that phonelist is missing.
- Phones only the web list has are never removed by the PLC: they may still be
- waiting in the queue. A deletion made on the PLC while the push is disabled,
- or lost from the full outbox or at a reboot before it was sent, is therefore
- not reflected on the web: remove that phone in the web app as well.
+ A phone or user change applies from the next BLE login on: a phone or user
+ that is connected stays connected (as with a change made on this panel; a
+ timed user whose new window has ended is disconnected by the usual check).
+
+ Network settings are checked against the Network Settings page's rules,
+ saved to NVS (stageCloudNetwork()) and applied by a restart. The restart is
+ made only once no phone has been connected for 10 s (the outputs are off then,
+ as after any disconnect), and at least 20 s after saving so the web app is
+ told first (restartForNetworkWhenIdle() in main.cpp, logged as
+ NETWORK_RESTART). A power cycle applies them as well. Settings that are already
+ in use are confirmed without a restart. The Wi-Fi password travels in plain
+ text (the access point needs it) and is deleted from the queue once saved.
+
+ PLC -> web. Phones and users added, changed or deleted on the PLC (this web
+ panel, the mobile app's ADD_USER) are written to phonelist / userlist (up to 4
+ changes per list wait in RAM while the network is down; beyond that the lists
+ are compared again). After every boot the lists are compared: the PLC's
+ entries are written (phones: only the missing ones, so a model typed in the
+ web app stays), and web entries the PLC does not have and that are not
+ waiting in a queue are deleted.
 
  Limits. Each request is a TLS session of its own, so heartbeats always go
- first and a sync waits for free memory like they do. A change applies from the
- next BLE login on: a phone that is already connected is not disconnected, as
- with a change made on the local Devices page. Nothing here touches outputs,
- E-STOP or the BLE stack. Status: web panel > System > Firebase, "Phone sync".
+ first and a sync waits for free memory like they do. A change queued in the
+ web app at the very moment the PLC confirms the previous one for the same
+ entry can be lost (there is no conditional delete); queue it again. Nothing
+ here touches outputs, E-STOP or the BLE stack, except the idle restart above.
+ Status: web panel > System > Firebase ("Phone sync", "User sync", "Network
+ settings sync").
+
+ Passwords (src/password_hash.cpp). User passwords are stored as
+ "$p1$<salt>$<hash>": PBKDF2-HMAC-SHA256, 2000 iterations, 12-byte random salt,
+ 24-byte result, both base64url (53 characters). Every login (BLE, this panel)
+ hashes the typed password once and compares. The web app hashes in the browser
+ the same way, so a password set there reaches the PLC only as a hash.
+ Passwords stored in plain text by older firmware are converted at boot. At
+ boot the code is checked against the RFC 7914 test vector and the web app's
+ vector, and the time one hash takes is printed ([PASSWORD] Self-test ...). The
+ current password can no longer be shown: the Edit User and Account pages
+ leave it blank (blank keeps it). The Super Admin's own web login is not a
+ BLE user and is unchanged.
 
 
 ================================================================================

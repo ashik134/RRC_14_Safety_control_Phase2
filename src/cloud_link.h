@@ -61,9 +61,11 @@ struct FirebaseInfo {
   uint32_t lastOkAgoS;    // valid when everOk
   uint32_t okCount;
   uint32_t failCount;
-  // Phone list sync with the web app (see cloudLinkLoop()).
+  // Sync with the web app (see cloudLinkLoop()).
   char     phoneState[96];
-  bool     phoneEverOk;
+  char     userState[96];
+  char     networkState[96];
+  bool     phoneEverOk;       // any sync request succeeded
   uint32_t phoneLastOkAgoS;   // valid when phoneEverOk
 };
 
@@ -73,24 +75,36 @@ void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info);
 bool cloudLinkSaveFirebase(const FirebaseSettings &next);
 void cloudLinkClearFirebase();
 
-// ---- Phone list sync with the web app (BLE Face Access section) ----
+// ---- Sync with the web app (BLE Face Access section) ----
 // While the Firebase push is on, the network task also keeps the Device
-// Registry (devices[]) in step with the web app, the way the MA devices do it:
+// Registry (devices[]), the users (users[]) and the network settings in step
+// with the web app, the way the MA devices do it (paths in cloud_wire.h):
 //  * web -> PLC: it polls devices/{id}/tobesynced; when true it clears it and
-//    reads the queue devices/{id}/tobesyncedphoneid. Each entry is applied
-//    here, then deleted, or marked {status: "rejected", reason}. Every run
-//    that applied something is logged in devices/{id}/synchistory.
-//  * PLC -> web: phones registered or deleted on this PLC's own web page are
-//    written to devices/{id}/phonelist (source "plc"), and after each boot the
-//    PLC adds any of its phones the web list is missing.
-// It never touches outputs, E-STOP or the BLE link: a change applies from the
-// next BLE login on, like a change made on the local web page.
+//    reads the queues tobesyncedphoneid, tobesyncedusers and
+//    tobesyncednetwork. Each entry is applied here, then deleted, or marked
+//    {status: "rejected", reason}. Every run that applied something is
+//    logged in devices/{id}/synchistory.
+//  * PLC -> web: phones and users added, changed or deleted on the PLC (its
+//    web page, the mobile app) are written to phonelist / userlist (source
+//    "plc", never a password). After each boot the lists are compared: the
+//    PLC's entries are written, and entries the PLC does not have and that
+//    are not waiting in a queue are removed.
+// It never touches outputs, E-STOP or the BLE link: a phone or user change
+// applies from the next BLE login on, like a change made on the local web
+// page. New network settings are applied by a restart, only once no phone has
+// been connected for 10 s (main.cpp).
 
 // Call from loop() on every pass while cloudLinkRunning(). This is where the
-// registry is changed and read for the network task, so devices[] is only
-// ever touched from loop()'s task. Cheap when there is nothing to do.
+// lists are changed and read for the network task, so devices[] and users[]
+// are only ever changed from loop()'s task. Cheap when there is nothing to do.
 void cloudLinkLoop();
 
-// A phone was registered (removed = false) or deleted on the local web page.
+// A phone was registered (removed = false) or deleted on the PLC.
 // From loop()'s task, after the change has been saved.
 void cloudLinkPhoneChanged(const char *phoneId, const char *owner, bool removed);
+
+// A user was added or changed (`now`, after saving) and/or removed
+// (`removedEmail`: a deleted user, or a changed email's old value) on the PLC.
+// From loop()'s task. Never sends the password.
+struct User;
+void cloudLinkUserChanged(const User *now, const char *removedEmail);

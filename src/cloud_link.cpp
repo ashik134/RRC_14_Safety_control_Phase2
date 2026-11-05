@@ -12,7 +12,8 @@
 
 #include "cloud_roots.h"
 #include "eth_diag.h"
-#include "web_handler.h"   // FIRMWARE_VERSION
+#include "web_handler.h"   // FIRMWARE_VERSION, devices[], users[]
+#include <ArduinoJson.h>   // shallow list replies, when comparing the lists
 
 // The Firebase project is chosen at build time, in platformio.ini build_flags:
 //   -DCLOUD_PROJECT_ID=\"your-project-id\"
@@ -101,57 +102,101 @@ static char             fbHost[80] = "";
 // as offline after this plus 60 s of silence.
 static const unsigned FB_HEARTBEAT_S = 60;
 
-// ---- phone list sync (see cloud_link.h) ----
-// Every request is a TLS session of its own (~50 KB of heap, 1-3 s), so the
-// flag is polled at a modest rate and the queue is read a few entries at a time.
-static const unsigned long PH_POLL_MS      = 20000;   // tobesynced poll
-static const unsigned long PH_RETRY_MS     = 30000;   // after a failed request
-static const unsigned long PH_NEXT_MS      = 1000;    // between the jobs of one sync
-static const unsigned long PH_LOOP_WAIT_MS = 30000;   // for loop() to pick up a job
-static const int           PH_PAGE         = 4;       // queue entries per GET (fits mem->resp)
-static const int           PH_PAGES_PER_GO = 5;       // then let the heartbeat run
-static const int           PH_PATCH_BATCH  = 3;       // phonelist changes per PATCH (fits mem->body)
-static const int           PH_OUTBOX       = 4;       // local-page changes waiting to be sent
+// A change the web app's Overview shows live (motion, E-STOP, the BLE
+// connection, SD/RTC, a pending restart) is pushed early instead of waiting
+// for the next heartbeat, but at most once per FB_LIVE_GAP_MS: each push is a
+// TLS session of its own, and the sync must still get its turns.
+static const unsigned long FB_LIVE_GAP_MS = 5000;
+static bool                fbLiveDirty    = false;   // under `mux`
 
-// Local web page changes for phonelist, oldest first. Shared with loop(), under `mux`.
+static bool liveFieldsDiffer(const CloudStatus &a, const CloudStatus &b) {
+  return a.estop != b.estop || a.up != b.up || a.down != b.down || a.left != b.left || a.right != b.right ||
+         a.bleConn != b.bleConn || a.bleAuth != b.bleAuth || strcmp(a.bleUser, b.bleUser) != 0 || a.sdOk != b.sdOk ||
+         a.rtcOk != b.rtcOk || a.netRestartPending != b.netRestartPending;
+}
+
+// ---- sync with the web app (see cloud_link.h) ----
+// Every request is a TLS session of its own (~50 KB of heap, 1-3 s), so the
+// flag is polled at a modest rate and the queues are read a few entries at a time.
+static const unsigned long SY_POLL_MS      = 20000;   // tobesynced poll
+static const unsigned long SY_RETRY_MS     = 30000;   // after a failed request
+static const unsigned long SY_NEXT_MS      = 1000;    // between the jobs of one sync
+static const unsigned long SY_LOOP_WAIT_MS = 30000;   // for loop() to pick up a job
+static const int           SY_PAGES_PER_GO = 5;       // then let the heartbeat run
+static const int           SY_LIST_BATCH   = 3;       // phonelist/userlist records per PATCH (fits mem->body)
+static const int           SY_DELETE_BATCH = 8;       // stale list keys per PATCH
+static const int           SY_OUTBOX       = 4;       // PLC-side changes waiting to be sent, per list
+static const size_t        SY_STALE_CAP    = 2048;    // bytes of stale web keys handled per comparison
+static const int           PH_PAGE         = 4;       // queue entries per GET (fits mem->resp)
+static const int           US_PAGE         = 3;
+
+// Changes made on the PLC, for phonelist / userlist, oldest first. Shared with
+// loop(), under `mux`.
 struct PhoneChange {
   char phoneId[PHONE_ID_MAX + 1];
   char owner[64];
   bool removed;
 };
-static PhoneChange   phOutbox[PH_OUTBOX];
+struct UserChange {
+  char     email[64];
+  char     name[64];
+  char     role[16];
+  uint8_t  accessType;
+  uint32_t startTs, endTs;
+  bool     removed;
+};
+static PhoneChange   phOutbox[SY_OUTBOX];
 static int           phOutboxCount    = 0;
 static bool          phOutboxOverflow = false;   // a change was dropped: compare the lists again
+static UserChange    usOutbox[SY_OUTBOX];
+static int           usOutboxCount    = 0;
+static bool          usOutboxOverflow = false;
 
-static char          phState[96]  = "Not started";
-static bool          phEverOk     = false;
-static unsigned long phLastOkMs   = 0;
+static char          phState[96] = "Not started";
+static char          usState[96] = "Not started";
+static char          nwState[96] = "Not started";
+static bool          syEverOk    = false;
+static unsigned long syLastOkMs  = 0;
 
 // The network task's own sync state.
-static bool          phReconcilePending = true;   // compare phonelist with the registry (once per boot)
-static bool          phPassPending      = true;   // read the queue (once at boot, then when tobesynced)
-static bool          phPassActive       = false;  // a pass is under way: phCursor and phCounts are live
-static bool          phClearFlag        = false;  // tobesynced was true: set it false before reading
-static unsigned long phNextPollMs       = 0;
-static unsigned long phNextWorkMs       = 0;
-static char          phCursor[PHONE_KEY_MAX + 1] = "";
-static PhoneSyncCounts phCounts         = {};
-static int           phPageSize         = PH_PAGE;
+struct QueueRun {
+  bool       pending;    // read the queue (once at boot, then when tobesynced)
+  bool       active;     // a pass is under way: cursor and counts are live
+  bool       stuck;      // cannot read past some entry: not retried until the next request
+  bool       unsaved;    // the PLC could not store a change: retried after SY_RETRY_MS
+  char       cursor[QUEUE_KEY_MAX + 1];
+  SyncCounts counts;
+  int        pageSize;
+};
+static QueueRun      phRun = {true};
+static QueueRun      usRun = {true};
+static bool          syReconcilePhones = true;   // compare the lists (once per boot)
+static bool          syReconcileUsers  = true;
+static bool          syNetPending      = true;   // look for queued network settings
+static bool          syClearFlag       = false;  // tobesynced was true: set it false before reading
+static unsigned long syNextPollMs      = 0;
+static unsigned long syNextWorkMs      = 0;
 
-// Work handed to loop()'s task, which owns devices[]. One job at a time: the
-// network task sets it Requested; loop() takes it (Serving), does it and sets
-// Done. The network task gives up only on a job loop() has not taken, so the
-// buffer is never freed while loop() uses it.
+// Work handed to loop()'s task, which owns devices[] and users[]. One job at a
+// time: the network task sets it Requested; loop() takes it (Serving), does it
+// and sets Done. The network task gives up only on a job loop() has not taken,
+// so the buffer is never freed while loop() uses it.
 enum : uint8_t { JOB_IDLE, JOB_REQUESTED, JOB_SERVING, JOB_DONE };
-enum : uint8_t { JOB_APPLY, JOB_SNAPSHOT };
-struct LocalPhone {
-  char id[PHONE_ID_MAX + 1];
-  char owner[64];
+enum : uint8_t {
+  JOB_APPLY_PHONES,     // buf = PhoneOp[count]
+  JOB_APPLY_USERS,      // buf = UserOp[count]
+  JOB_KEYS_PHONES,      // buf = NUL-separated keys, cap bytes; result = how many
+  JOB_KEYS_USERS,
+  JOB_RECORDS_PHONES,   // buf = PhoneOp[count] from index `start`; result = how many
+  JOB_RECORDS_USERS,    // buf = UserOp[count]
+  JOB_NETWORK,          // buf = NetworkRequest; result = stageCloudNetwork()
 };
 static volatile uint8_t jobState  = JOB_IDLE;
-static uint8_t          jobKind   = JOB_APPLY;
+static uint8_t          jobKind   = JOB_APPLY_PHONES;
 static void            *jobBuf    = nullptr;
+static int              jobStart  = 0;
 static int              jobCount  = 0;
+static size_t           jobCap    = 0;
 static int              jobResult = 0;
 
 static void setStateIn(char *dst, size_t cap, const char *tag, const char *fmt, va_list ap) {
@@ -183,6 +228,20 @@ static void setPhState(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   setStateIn(phState, sizeof(phState), "PHONESYNC", fmt, ap);
+  va_end(ap);
+}
+
+static void setUsState(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  setStateIn(usState, sizeof(usState), "USERSYNC", fmt, ap);
+  va_end(ap);
+}
+
+static void setNwState(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  setStateIn(nwState, sizeof(nwState), "NETSYNC", fmt, ap);
   va_end(ap);
 }
 
@@ -388,9 +447,12 @@ static Outcome sendFirebasePush() {
   CloudStatus s;
   taskENTER_CRITICAL(&mux);
   s = sharedStatus;
+  fbLiveDirty = false;   // this push carries the latest change
   taskEXIT_CRITICAL(&mux);
   strlcpy(s.ip, Ethernet.localIP().toString().c_str(), sizeof(s.ip));
-  s.uptimeS = (uint32_t)(esp_timer_get_time() / 1000000LL);
+  s.uptimeS     = (uint32_t)(esp_timer_get_time() / 1000000LL);
+  s.freeHeap    = (uint32_t)ESP.getFreeHeap();
+  s.minFreeHeap = (uint32_t)ESP.getMinFreeHeap();
 
   char path[160];   // holds the secret: keep it off the heap and out of every log
   size_t pathLen = cloudBuildDevicePath(path, sizeof(path), fb.deviceId, fb.secret);
@@ -423,7 +485,9 @@ static Outcome sendFirebasePush() {
   return status >= 500 ? Outcome::Failed : Outcome::Rejected;
 }
 
-// ---------------- phone list sync ----------------
+// ---------------- sync with the web app ----------------
+
+typedef void (*StateFn)(const char *fmt, ...);
 
 static bool tlsHeapOk() { return ESP.getFreeHeap() >= TLS_MIN_FREE_HEAP && ESP.getMaxAllocHeap() >= TLS_MIN_LARGEST; }
 
@@ -445,45 +509,47 @@ static int fbRequest(const char *method, const char *child, const char *query, c
 // cannot help (the heartbeat shows the same problem).
 enum class PhRes { Ok, Retry, Heap, Rejected };
 
-static PhRes phFailed(const char *what, int status, const char *stage) {
+static PhRes syFailed(StateFn st, const char *what, int status, const char *stage) {
   if (status == 0) {
-    setPhState("%s failed at: %s", what, stage);
+    st("%s failed at: %s", what, stage);
     return PhRes::Retry;
   }
   if (status == 401 || status == 403) {
-    setPhState("%s refused (HTTP %d): check the database secret", what, status);
+    st("%s refused (HTTP %d): check the database secret", what, status);
     return PhRes::Rejected;
   }
   if (status == 404) {
-    setPhState("%s: database not found (HTTP 404)", what);
+    st("%s: database not found (HTTP 404)", what);
     return PhRes::Rejected;
   }
-  setPhState("%s refused (HTTP %d)", what, status);
+  st("%s refused (HTTP %d)", what, status);
   return status >= 500 ? PhRes::Retry : PhRes::Rejected;
 }
 
-static void phMarkOk() {
+static void syMarkOk() {
   taskENTER_CRITICAL(&mux);
-  phEverOk   = true;
-  phLastOkMs = millis();
+  syEverOk   = true;
+  syLastOkMs = millis();
   taskEXIT_CRITICAL(&mux);
 }
 
 // Runs a job on loop()'s task (see cloudLinkLoop()) and waits for it. False if
-// loop() did not take it within PH_LOOP_WAIT_MS: it is then withdrawn, so
+// loop() did not take it within SY_LOOP_WAIT_MS: it is then withdrawn, so
 // `buf` is the caller's again either way.
-static bool runOnLoop(uint8_t kind, void *buf, int count, int &result) {
+static bool runOnLoop(uint8_t kind, void *buf, int start, int count, size_t cap, int &result) {
   taskENTER_CRITICAL(&mux);
   jobKind   = kind;
   jobBuf    = buf;
+  jobStart  = start;
   jobCount  = count;
+  jobCap    = cap;
   jobResult = 0;
   jobState  = JOB_REQUESTED;
   taskEXIT_CRITICAL(&mux);
 
   unsigned long t0 = millis();
   for (;;) {
-    bool late = millis() - t0 >= PH_LOOP_WAIT_MS;
+    bool late = millis() - t0 >= SY_LOOP_WAIT_MS;
     taskENTER_CRITICAL(&mux);
     uint8_t st = jobState;
     if (st == JOB_DONE) {
@@ -502,140 +568,255 @@ static bool runOnLoop(uint8_t kind, void *buf, int count, int &result) {
   }
 }
 
-static void tally(const PhoneOp &op) {
-  if (op.outcome == PHONE_PENDING) return;
-  phCounts.entries++;
-  switch (op.outcome) {
-    case PHONE_ADDED:    phCounts.added++; break;
-    case PHONE_UPDATED:  phCounts.updated++; break;
-    case PHONE_REMOVED:
-    case PHONE_ABSENT:   phCounts.removed++; break;
-    case PHONE_REJECTED: phCounts.rejected++; break;
-    default: break;
-  }
+// Writes a synchistory record. A log, not state: a failed write is not retried.
+static void writeHistory(const char *type, const char *status, const SyncCounts &c) {
+  char ts[20];
+  taskENTER_CRITICAL(&mux);
+  memcpy(ts, sharedStatus.rtc, sizeof(ts));
+  taskEXIT_CRITICAL(&mux);
+  char key[24];
+  cloudHistoryKey(ts, (unsigned long)(esp_timer_get_time() / 1000000LL), key, sizeof(key));
+  char child[48];
+  snprintf(child, sizeof(child), "synchistory/%s-%s", key, type);   // the type keeps same-second runs apart
+  if (cloudBuildSyncRecord(mem->body, sizeof(mem->body), type, fb.deviceId, ts, status, c) == 0) return;
+  if (!tlsHeapOk()) return;
+  const char *stage = "";
+  int st = fbRequest("PUT", child, "", mem->body, stage);
+  if (st != 200) Serial.printf("[SYNC] History not written (HTTP %d %s)\n", st, st ? "" : stage);
 }
 
-// Sends `n` phonelist changes in one PATCH. PhRes::Ok also when the database
-// refused them as invalid: they are dropped rather than retried forever.
-static PhRes sendPhonelistOps(const PhoneOp *ops, int n) {
-  if (cloudBuildPhonelistPatch(mem->body, sizeof(mem->body), ops, n) == 0) {
-    setPhState("A phone change was too long to send; dropped");
-    return PhRes::Ok;
-  }
+// Sends one PATCH of a list (phonelist / userlist). PhRes::Ok also when the
+// database refused it as invalid: dropped rather than retried forever.
+static PhRes sendListPatch(StateFn st, const char *list, const char *what) {
   if (!tlsHeapOk()) return PhRes::Heap;
   const char *stage = "";
-  int st = fbRequest("PATCH", "phonelist", "", mem->body, stage);
-  if (st == 200) {
-    phMarkOk();
+  int status = fbRequest("PATCH", list, "", mem->body, stage);
+  if (status == 200) {
+    syMarkOk();
     return PhRes::Ok;
   }
-  if (st == 400) {
-    setPhState("Web phone list refused a change (HTTP 400); dropped");
+  if (status == 400) {
+    st("The web %s list refused a change (HTTP 400); dropped", what);
     return PhRes::Ok;
   }
-  return phFailed("Updating the web phone list", st, stage);
+  return syFailed(st, "Updating the web list", status, stage);
 }
 
-// After each boot, and when a local change could not be queued: every phone in
-// the registry that the web list is missing is added to it (source "plc").
-// Phones only the web app has are left alone: they may still be in the queue.
-struct ReconcileBufs {
-  LocalPhone local[MAX_DEVICES];
-  char       keys[MAX_DEVICES][PHONE_ID_MAX + 1];
-  bool       present[MAX_DEVICES];
-  PhoneOp    ops[PH_PATCH_BATCH];
+// ---- comparing the lists (after boot, or when a PLC change could not be queued) ----
+// The PLC's entries are written to the web list (users: all of them; phones:
+// the missing ones, so a model typed in the web app stays). Web entries the
+// PLC does not have and that are not waiting in the queue are deleted: they
+// were removed on the PLC while the sync was off, or cancelled in the web app.
+
+struct ListSpec {
+  const char *list;         // "phonelist"
+  const char *queue;        // "tobesyncedphoneid"
+  const char *what;         // "phone"
+  uint8_t     keysJob, recordsJob;
+  size_t      opSize;
+  int         maxLocal;
+  bool        upsertAll;
+  size_t (*build)(char *out, size_t cap, const void *ops, int n);
+  StateFn     state;
 };
 
-static PhRes phoneReconcileWith(ReconcileBufs &b) {
-  int n = 0;
-  if (!runOnLoop(JOB_SNAPSHOT, b.local, MAX_DEVICES, n)) {
-    setPhState("Waiting for the PLC main loop");
+static bool keyInPool(const char *pool, int n, const char *key, int *index = nullptr) {
+  const char *p = pool;
+  for (int i = 0; i < n; i++, p += strlen(p) + 1) {
+    if (strcmp(p, key) == 0) {
+      if (index) *index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static PhRes reconcileWith(const ListSpec &s, char *&local, char *&stale, void *&ops) {
+  // A. The PLC's keys.
+  size_t cap = (size_t)s.maxLocal * (QUEUE_KEY_MAX + 1);
+  local = static_cast<char *>(malloc(cap));
+  if (!local) return PhRes::Heap;
+  int nLocal = 0;
+  if (!runOnLoop(s.keysJob, local, 0, s.maxLocal, cap, nLocal)) {
+    s.state("Waiting for the PLC main loop");
     return PhRes::Retry;
   }
-  int m = 0;   // phones with a usable key, packed to the front
-  for (int i = 0; i < n; i++) {
-    if (!cloudPhoneKey(b.local[i].id, b.keys[m], sizeof(b.keys[m]))) continue;
-    if (m != i) b.local[m] = b.local[i];
-    m++;
-  }
-  if (m == 0) {
-    setPhState("No phones on the PLC to add to the web list");
-    return PhRes::Ok;
-  }
+  size_t used = 0;
+  for (int i = 0; i < nLocal; i++) used += strlen(local + used) + 1;
+  char *shrunk = static_cast<char *>(realloc(local, used ? used : 1));   // keep the heap free for TLS
+  if (shrunk) local = shrunk;
 
+  // B. The web list: which PLC entries it has, and which of its own the PLC does not.
   if (!tlsHeapOk()) return PhRes::Heap;
   const char *stage = "";
-  int st = fbRequest("GET", "phonelist", "shallow=true", "", stage);
-  if (st != 200) return phFailed("Reading the web phone list", st, stage);
-  if (!cloudShallowHasKeys(cloudHttpBody(mem->resp), b.keys, m, b.present)) {
-    setPhState("Web phone list too long to compare; skipped");
-    return PhRes::Ok;   // later local changes are still sent one by one
-  }
-  phMarkOk();
-
-  int added = 0;
-  int i = 0;
-  while (i < m) {
-    int k = 0;
-    for (; i < m && k < PH_PATCH_BATCH; i++) {
-      if (b.present[i]) continue;
-      PhoneOp &op = b.ops[k++];
-      memset(&op, 0, sizeof(op));
-      strlcpy(op.key, b.keys[i], sizeof(op.key));
-      strlcpy(op.phoneId, b.local[i].id, sizeof(op.phoneId));
-      strlcpy(op.owner, b.local[i].owner, sizeof(op.owner));
-      op.action = PHONE_ADD;
+  int st = fbRequest("GET", s.list, "shallow=true", "", stage);
+  if (st != 200) return syFailed(s.state, "Reading the web list", st, stage);
+  uint64_t present = 0;
+  int nStale = 0;
+  size_t staleUsed = 0;
+  bool staleFull = false;
+  {
+    JsonDocument doc;
+    if (deserializeJson(doc, cloudHttpBody(mem->resp) ? cloudHttpBody(mem->resp) : "")) {
+      s.state("The web %s list is too long to compare; skipped", s.what);
+      return PhRes::Ok;
     }
-    if (k == 0) break;
-    PhRes r = sendPhonelistOps(b.ops, k);
-    if (r != PhRes::Ok) return r;   // the whole comparison is repeated next time
-    added += k;
+    if (doc.is<JsonObjectConst>()) {
+      for (JsonPairConst kv : doc.as<JsonObjectConst>()) {
+        const char *key = kv.key().c_str();
+        int idx = -1;
+        if (keyInPool(local, nLocal, key, &idx)) {
+          if (idx < 64) present |= 1ULL << idx;
+          continue;
+        }
+        size_t kl = strlen(key) + 1;
+        if (!stale) stale = static_cast<char *>(malloc(SY_STALE_CAP));
+        if (!stale || staleUsed + kl > SY_STALE_CAP) {
+          staleFull = true;
+          continue;
+        }
+        memcpy(stale + staleUsed, key, kl);
+        staleUsed += kl;
+        nStale++;
+      }
+    }
   }
-  if (added) setPhState("Added %d PLC phone(s) to the web list", added);
-  else setPhState("Web phone list has every PLC phone");
+  free(local);
+  local = nullptr;
+  syMarkOk();
+
+  // C. Stale entries still waiting in the queue are not stale: keep them.
+  if (nStale > 0) {
+    if (!tlsHeapOk()) return PhRes::Heap;
+    st = fbRequest("GET", s.queue, "shallow=true", "", stage);
+    if (st != 200) return syFailed(s.state, "Reading the queue", st, stage);
+    JsonDocument doc;
+    if (deserializeJson(doc, cloudHttpBody(mem->resp) ? cloudHttpBody(mem->resp) : "")) {
+      nStale = 0;   // cannot tell which are queued: delete nothing
+    } else if (doc.is<JsonObjectConst>()) {
+      JsonObjectConst queued = doc.as<JsonObjectConst>();
+      char *w = stale;
+      const char *r = stale;
+      int kept = 0;
+      for (int i = 0; i < nStale; i++) {
+        size_t kl = strlen(r) + 1;
+        if (queued[r].isNull()) {
+          memmove(w, r, kl);
+          w += kl;
+          kept++;
+        }
+        r += kl;
+      }
+      nStale = kept;
+    }
+  }
+
+  // D. Delete the stale ones.
+  int deleted = 0;
+  const char *p = stale;
+  while (deleted < nStale) {
+    const char *keys[SY_DELETE_BATCH];
+    int k = 0;
+    for (; k < SY_DELETE_BATCH && deleted + k < nStale; k++, p += strlen(p) + 1) keys[k] = p;
+    if (cloudBuildDeleteKeys(mem->body, sizeof(mem->body), keys, k) == 0) break;
+    PhRes r = sendListPatch(s.state, s.list, s.what);
+    if (r != PhRes::Ok) return r;
+    deleted += k;
+  }
+  free(stale);
+  stale = nullptr;
+
+  // E. Write the PLC's entries.
+  ops = malloc(s.opSize * SY_LIST_BATCH);
+  if (!ops) return PhRes::Heap;
+  int written = 0;
+  for (int start = 0;; start += SY_LIST_BATCH) {
+    int got = 0;
+    if (!runOnLoop(s.recordsJob, ops, start, SY_LIST_BATCH, 0, got)) {
+      s.state("Waiting for the PLC main loop");
+      return PhRes::Retry;
+    }
+    // Keep the ones to send, packed to the front.
+    int k = 0;
+    for (int i = 0; i < got; i++) {
+      unsigned char *op = static_cast<unsigned char *>(ops) + s.opSize * i;
+      const QueueOpHead &h = *reinterpret_cast<const QueueOpHead *>(op);
+      int idx = start + i;
+      bool have = idx < 64 && (present & (1ULL << idx));
+      if (!h.key[0] || (!s.upsertAll && have)) continue;
+      if (k != i) memmove(static_cast<unsigned char *>(ops) + s.opSize * k, op, s.opSize);
+      k++;
+    }
+    if (k > 0) {
+      if (s.build(mem->body, sizeof(mem->body), ops, k) == 0) {
+        s.state("A %s record was too long to send; skipped", s.what);
+      } else {
+        PhRes r = sendListPatch(s.state, s.list, s.what);
+        if (r != PhRes::Ok) return r;
+        written += k;
+      }
+    }
+    if (got < SY_LIST_BATCH) break;
+  }
+  if (staleFull) s.state("Compared; some old web %s entries are left for next time", s.what);
+  else s.state("Compared: %d written to the web list, %d old ones removed", written, deleted);
   return PhRes::Ok;
 }
 
-static PhRes phoneReconcile() {
-  ReconcileBufs *b = static_cast<ReconcileBufs *>(malloc(sizeof(ReconcileBufs)));
-  if (!b) return PhRes::Heap;
-  PhRes r = phoneReconcileWith(*b);
-  free(b);
+static PhRes reconcile(const ListSpec &s) {
+  char *local = nullptr, *stale = nullptr;
+  void *ops = nullptr;
+  PhRes r = reconcileWith(s, local, stale, ops);
+  free(local);
+  free(stale);
+  if (ops) memset(ops, 0, s.opSize * SY_LIST_BATCH);
+  free(ops);
   return r;
 }
 
-// Sends the oldest local-page changes to phonelist.
-static PhRes phoneFlushOutbox() {
-  PhoneChange batch[PH_PATCH_BATCH];
+static size_t buildPhonelist(char *out, size_t cap, const void *ops, int n) {
+  return cloudBuildPhonelistPatch(out, cap, static_cast<const PhoneOp *>(ops), n);
+}
+static size_t buildUserlist(char *out, size_t cap, const void *ops, int n) {
+  return cloudBuildUserlistPatch(out, cap, static_cast<const UserOp *>(ops), n);
+}
+
+static const ListSpec PHONE_LIST = {"phonelist", "tobesyncedphoneid", "phone", JOB_KEYS_PHONES, JOB_RECORDS_PHONES,
+                                    sizeof(PhoneOp), MAX_DEVICES, false, buildPhonelist, setPhState};
+static const ListSpec USER_LIST  = {"userlist", "tobesyncedusers", "user", JOB_KEYS_USERS, JOB_RECORDS_USERS,
+                                    sizeof(UserOp), MAX_USERS, true, buildUserlist, setUsState};
+
+// ---- PLC-side changes ----
+
+static PhRes flushPhoneOutbox() {
+  PhoneChange batch[SY_LIST_BATCH];
   int k;
-  bool overflow;
   taskENTER_CRITICAL(&mux);
-  k = phOutboxCount < PH_PATCH_BATCH ? phOutboxCount : PH_PATCH_BATCH;
+  k = phOutboxCount < SY_LIST_BATCH ? phOutboxCount : SY_LIST_BATCH;
   memcpy(batch, phOutbox, sizeof(PhoneChange) * k);
-  overflow = phOutboxOverflow;
-  phOutboxOverflow = false;
   taskEXIT_CRITICAL(&mux);
-  if (overflow) phReconcilePending = true;
   if (k == 0) return PhRes::Ok;
 
-  PhoneOp *ops = static_cast<PhoneOp *>(malloc(sizeof(PhoneOp) * PH_PATCH_BATCH));
+  PhoneOp *ops = static_cast<PhoneOp *>(malloc(sizeof(PhoneOp) * SY_LIST_BATCH));
   if (!ops) return PhRes::Heap;
-  int used = 0;   // outbox entries this batch covers
-  int nOps = 0;
+  int used = 0, nOps = 0;   // outbox entries covered, ops built
   for (; used < k; used++) {
     PhoneOp &op = ops[nOps];
     memset(&op, 0, sizeof(op));
-    if (!cloudPhoneKey(batch[used].phoneId, op.key, sizeof(op.key))) continue;   // no key: nothing to send
+    if (!cloudPhoneKey(batch[used].phoneId, op.h.key, sizeof(op.h.key))) continue;   // no key: nothing to send
     bool again = false;   // the same phone twice: its later change goes in the next PATCH
-    for (int j = 0; j < nOps; j++) again = again || strcmp(ops[j].key, op.key) == 0;
+    for (int j = 0; j < nOps; j++) again = again || strcmp(ops[j].h.key, op.h.key) == 0;
     if (again) break;
     strlcpy(op.phoneId, batch[used].phoneId, sizeof(op.phoneId));
     strlcpy(op.owner, batch[used].owner, sizeof(op.owner));
-    op.action = batch[used].removed ? PHONE_REMOVE : PHONE_ADD;
+    op.h.action = batch[used].removed ? OP_REMOVE : OP_ADD;
     nOps++;
   }
-
-  PhRes r = nOps > 0 ? sendPhonelistOps(ops, nOps) : PhRes::Ok;
+  PhRes r = PhRes::Ok;
+  if (nOps > 0) {
+    if (cloudBuildPhonelistPatch(mem->body, sizeof(mem->body), ops, nOps) == 0) setPhState("A phone change was too long to send; dropped");
+    else r = sendListPatch(setPhState, "phonelist", "phone");
+  }
   free(ops);
   if (r != PhRes::Ok) return r;
 
@@ -648,218 +829,376 @@ static PhRes phoneFlushOutbox() {
   return PhRes::Ok;
 }
 
-static PhRes phonePoll() {
-  if (!tlsHeapOk()) return PhRes::Heap;
-  const char *stage = "";
-  int st = fbRequest("GET", "tobesynced", "", "", stage);
-  if (st != 200) return phFailed("Checking for a sync request", st, stage);
-  phMarkOk();
-  const char *body = cloudHttpBody(mem->resp);
-  if (body && strncmp(body, "true", 4) == 0) {
-    phClearFlag   = true;
-    phPassPending = true;
-    setPhState("Sync requested by the web app");
-  } else {
-    setPhState("Up to date");
+static PhRes flushUserOutbox() {
+  UserChange batch[SY_LIST_BATCH];
+  int k;
+  taskENTER_CRITICAL(&mux);
+  k = usOutboxCount < SY_LIST_BATCH ? usOutboxCount : SY_LIST_BATCH;
+  memcpy(batch, usOutbox, sizeof(UserChange) * k);
+  taskEXIT_CRITICAL(&mux);
+  if (k == 0) return PhRes::Ok;
+
+  UserOp *ops = static_cast<UserOp *>(malloc(sizeof(UserOp) * SY_LIST_BATCH));
+  if (!ops) return PhRes::Heap;
+  int used = 0, nOps = 0;
+  for (; used < k; used++) {
+    UserOp &op = ops[nOps];
+    memset(&op, 0, sizeof(op));
+    if (!cloudUserKey(batch[used].email, op.h.key, sizeof(op.h.key))) continue;
+    bool again = false;
+    for (int j = 0; j < nOps; j++) again = again || strcmp(ops[j].h.key, op.h.key) == 0;
+    if (again) break;
+    const UserChange &c = batch[used];
+    op.h.action = c.removed ? OP_REMOVE : OP_ADD;
+    strlcpy(op.email, c.email, sizeof(op.email));
+    strlcpy(op.name, c.name, sizeof(op.name));
+    strlcpy(op.role, c.role, sizeof(op.role));
+    op.accessType = c.accessType;
+    op.startTs    = c.startTs;
+    op.endTs      = c.endTs;
+    nOps++;
   }
+  PhRes r = PhRes::Ok;
+  if (nOps > 0) {
+    if (cloudBuildUserlistPatch(mem->body, sizeof(mem->body), ops, nOps) == 0) setUsState("A user change was too long to send; dropped");
+    else r = sendListPatch(setUsState, "userlist", "user");
+  }
+  free(ops);
+  if (r != PhRes::Ok) return r;
+
+  taskENTER_CRITICAL(&mux);
+  memmove(usOutbox, usOutbox + used, sizeof(UserChange) * (usOutboxCount - used));
+  usOutboxCount -= used;
+  taskEXIT_CRITICAL(&mux);
+  if (nOps > 0) setUsState("Sent %d user change(s) to the web list", nOps);
   return PhRes::Ok;
 }
 
-// How the current pass fell short. Stuck: it cannot read past some entry, so it
-// is not retried until the next request. Unsaved: the registry could not be
-// stored, so the pass is retried after PH_RETRY_MS.
-static bool phStuck   = false;
-static bool phUnsaved = false;
+// ---- the queues ----
 
-// One page of the queue: read it, apply it on loop(), confirm it. `done` once
+struct QueueSpec {
+  const char *child;   // "tobesyncedphoneid"
+  const char *type;    // synchistory type: "phones"
+  size_t      opSize;
+  int         page;
+  uint8_t     applyJob;
+  bool (*parse)(const char *body, const char *skip, void *ops, int maxOps, QueuePage &page);
+  StateFn     state;
+};
+
+static bool parsePhones(const char *b, const char *s, void *ops, int m, QueuePage &p) {
+  return cloudParsePhoneQueue(b, s, static_cast<PhoneOp *>(ops), m, p);
+}
+static bool parseUsers(const char *b, const char *s, void *ops, int m, QueuePage &p) {
+  return cloudParseUserQueue(b, s, static_cast<UserOp *>(ops), m, p);
+}
+
+static const QueueSpec PHONE_QUEUE = {"tobesyncedphoneid", "phones", sizeof(PhoneOp), PH_PAGE, JOB_APPLY_PHONES,
+                                      parsePhones, setPhState};
+static const QueueSpec USER_QUEUE  = {"tobesyncedusers", "users", sizeof(UserOp), US_PAGE, JOB_APPLY_USERS,
+                                      parseUsers, setUsState};
+
+static void tally(SyncCounts &c, const QueueOpHead &h) {
+  if (h.outcome == OP_PENDING) return;
+  c.entries++;
+  switch (h.outcome) {
+    case OP_ADDED:    c.added++; break;
+    case OP_UPDATED:  c.updated++; break;
+    case OP_REMOVED:
+    case OP_ABSENT:   c.removed++; break;
+    case OP_REJECTED: c.rejected++; break;
+    default: break;
+  }
+}
+
+static const QueueOpHead &headAt(const void *ops, size_t stride, int i) {
+  return *reinterpret_cast<const QueueOpHead *>(static_cast<const unsigned char *>(ops) + stride * i);
+}
+
+// One page of a queue: read it, apply it on loop(), confirm it. `done` once
 // the end of the queue is reached.
-static PhRes phonePage(PhoneOp *ops, bool &done) {
+static PhRes queuePage(const QueueSpec &q, QueueRun &run, void *ops, bool &done) {
   if (!tlsHeapOk()) return PhRes::Heap;
 
   // orderBy="$key" (no index needed). startAt includes the cursor, so one more
   // is asked for and the cursor itself is skipped.
-  bool hasCursor = phCursor[0] != '\0';
-  int limit = hasCursor ? phPageSize + 1 : phPageSize;
+  bool hasCursor = run.cursor[0] != '\0';
+  int limit = hasCursor ? run.pageSize + 1 : run.pageSize;
   char query[200];   // with the rest of the path this stays inside fbRequest()'s 384 bytes
   int qn = snprintf(query, sizeof(query), "orderBy=%%22%%24key%%22&limitToFirst=%d", limit);
   if (hasCursor) {
-    char quoted[PHONE_KEY_MAX * 2 + 3];   // the cursor as a JSON string
-    size_t q = 0;
-    quoted[q++] = '"';
-    for (const char *c = phCursor; *c; c++) {
-      if (*c == '"' || *c == '\\') quoted[q++] = '\\';
-      quoted[q++] = *c;
+    char quoted[QUEUE_KEY_MAX * 2 + 3];   // the cursor as a JSON string
+    size_t n = 0;
+    quoted[n++] = '"';
+    for (const char *c = run.cursor; *c; c++) {
+      if (*c == '"' || *c == '\\') quoted[n++] = '\\';
+      quoted[n++] = *c;
     }
-    quoted[q++] = '"';
-    quoted[q] = '\0';
+    quoted[n++] = '"';
+    quoted[n] = '\0';
     char enc[sizeof(query)];
     if (cloudUrlEncode(quoted, enc, sizeof(enc)) == 0 ||
         snprintf(query + qn, sizeof(query) - qn, "&startAt=%s", enc) >= (int)(sizeof(query) - qn)) {
-      setPhState("A queue key is too long to read past");
-      phStuck = true;
+      q.state("A queue key is too long to read past");
+      run.stuck = true;
       done = true;
       return PhRes::Ok;
     }
   }
 
   const char *stage = "";
-  int st = fbRequest("GET", "tobesyncedphoneid", query, "", stage);
-  if (st != 200) return phFailed("Reading the sync queue", st, stage);
+  int st = fbRequest("GET", q.child, query, "", stage);
+  if (st != 200) return syFailed(q.state, "Reading the sync queue", st, stage);
 
-  PhoneQueuePage pg;
-  if (!cloudParsePhoneQueue(cloudHttpBody(mem->resp), hasCursor ? phCursor : nullptr, ops, PH_PAGE + 1, pg)) {
-    if (phPageSize > 1) {
-      phPageSize = 1;   // the page did not fit in the reply buffer: one entry at a time
+  QueuePage pg;
+  if (!q.parse(cloudHttpBody(mem->resp), hasCursor ? run.cursor : nullptr, ops, q.page + 1, pg)) {
+    if (run.pageSize > 1) {
+      run.pageSize = 1;   // the page did not fit in the reply buffer: one entry at a time
       return PhRes::Ok;
     }
-    setPhState("A queue entry is too large to read");
-    phStuck = true;
+    q.state("A queue entry is too large to read");
+    run.stuck = true;
     done = true;
     return PhRes::Ok;
   }
-  if (pg.keyTooLong) setPhState("Skipped a queue key longer than %d characters", PHONE_KEY_MAX);
+  if (pg.keyTooLong) q.state("Skipped a queue key longer than %d characters", QUEUE_KEY_MAX);
 
   if (pg.ops > 0) {
     int unused = 0;
-    if (!runOnLoop(JOB_APPLY, ops, pg.ops, unused)) {
-      setPhState("Waiting for the PLC main loop");
+    if (!runOnLoop(q.applyJob, ops, 0, pg.ops, 0, unused)) {
+      q.state("Waiting for the PLC main loop");
       return PhRes::Retry;   // nothing was applied: the same page is read again
     }
     // Applied. If confirming fails the entries stay and the page is read again;
     // applying them twice changes nothing.
     int confirmable = 0;
-    for (int i = 0; i < pg.ops; i++) confirmable += ops[i].outcome != PHONE_PENDING;
+    for (int i = 0; i < pg.ops; i++) confirmable += headAt(ops, q.opSize, i).outcome != OP_PENDING;
     int written = 0;
-    size_t len = cloudBuildQueueResult(mem->body, sizeof(mem->body), ops, pg.ops, written);
+    size_t len = cloudBuildQueueResult(mem->body, sizeof(mem->body), ops, q.opSize, pg.ops, written);
     if (confirmable > 0 && len == 0) {
-      setPhState("Queue result too long to send");
+      q.state("Queue result too long to send");
       return PhRes::Retry;
     }
     if (written > 0) {
       if (!tlsHeapOk()) return PhRes::Heap;
-      st = fbRequest("PATCH", "tobesyncedphoneid", "", mem->body, stage);
-      if (st != 200) return phFailed("Confirming queue entries", st, stage);
+      st = fbRequest("PATCH", q.child, "", mem->body, stage);
+      if (st != 200) return syFailed(q.state, "Confirming queue entries", st, stage);
     }
-    for (int i = 0; i < pg.ops; i++) tally(ops[i]);
-    if (confirmable < pg.ops) phUnsaved = true;   // left pending: the registry could not be stored
+    for (int i = 0; i < pg.ops; i++) tally(run.counts, headAt(ops, q.opSize, i));
+    if (confirmable < pg.ops) run.unsaved = true;   // left pending: the PLC could not store them
+
+    // Users the PLC now holds get their userlist record from the PLC itself
+    // (source "plc"), so the web app shows them as on the PLC. Best effort:
+    // the comparison after the next boot writes them anyway.
+    if (q.applyJob == JOB_APPLY_USERS) {
+      UserOp *u = static_cast<UserOp *>(ops);
+      int k = 0;
+      for (int i = 0; i < pg.ops; i++) {
+        uint8_t o = u[i].h.outcome;
+        if (o != OP_ADDED && o != OP_UPDATED && o != OP_UNCHANGED) continue;
+        if (k != i) u[k] = u[i];
+        u[k].h.action = OP_ADD;
+        k++;
+      }
+      if (k > 0 && cloudBuildUserlistPatch(mem->body, sizeof(mem->body), u, k) > 0) sendListPatch(setUsState, "userlist", "user");
+    }
   }
-  phMarkOk();
+  syMarkOk();
 
   if (pg.keys < limit || !pg.haveLast) {
     done = true;
     return PhRes::Ok;
   }
-  if (hasCursor && strcmp(pg.lastKey, phCursor) == 0) {
+  if (hasCursor && strcmp(pg.lastKey, run.cursor) == 0) {
     // A full page that ends at the cursor again: only unreadable keys after it.
-    setPhState("Cannot read past queue key %.40s", phCursor);
-    phStuck = true;
+    q.state("Cannot read past queue key %.40s", run.cursor);
+    run.stuck = true;
     done = true;
     return PhRes::Ok;
   }
-  strlcpy(phCursor, pg.lastKey, sizeof(phCursor));
-  phPageSize = PH_PAGE;
+  strlcpy(run.cursor, pg.lastKey, sizeof(run.cursor));
+  run.pageSize = q.page;
   return PhRes::Ok;
 }
 
 // Logs the pass in synchistory, if it did anything, and decides whether to
 // run another: a pass that applied something is followed by one more, which
 // picks up whatever the web app queued meanwhile (and anything paged past).
-static PhRes phoneFinishPass() {
-  phPassActive = false;
-  const PhoneSyncCounts c = phCounts;
+static PhRes finishPass(const QueueSpec &q, QueueRun &run) {
+  run.active = false;
+  const SyncCounts c = run.counts;
   bool applied = c.entries - c.rejected > 0;
-  // Unsaved entries are still in the queue: try them again in a while.
-  PhRes next = phUnsaved ? PhRes::Retry : PhRes::Ok;
-  phPassPending = phUnsaved || (applied && !phStuck);
+  PhRes next = run.unsaved ? PhRes::Retry : PhRes::Ok;   // unsaved entries are still queued
+  run.pending = run.unsaved || (applied && !run.stuck);
 
-  if (phUnsaved) setPhState("Could not save the phone list on the PLC; retrying");
+  if (run.unsaved) q.state("Could not save the change on the PLC; retrying");
   if (c.entries == 0) {
-    if (!phStuck && !phUnsaved) setPhState("Up to date");
+    if (!run.stuck && !run.unsaved) q.state("Up to date");
     return next;
   }
-  const char *status = (phStuck || phUnsaved) ? "incomplete" : (c.rejected > 0 ? "partial" : "success");
-  if (!phStuck && !phUnsaved)
-    setPhState("Synced: %d added, %d updated, %d removed, %d rejected", c.added, c.updated, c.removed, c.rejected);
-
-  char ts[20];
-  taskENTER_CRITICAL(&mux);
-  memcpy(ts, sharedStatus.rtc, sizeof(ts));
-  taskEXIT_CRITICAL(&mux);
-  char key[24];
-  cloudHistoryKey(ts, (unsigned long)(esp_timer_get_time() / 1000000LL), key, sizeof(key));
-  char child[48];
-  snprintf(child, sizeof(child), "synchistory/%s", key);
-  if (cloudBuildPhoneSyncRecord(mem->body, sizeof(mem->body), fb.deviceId, ts, status, c) == 0) return next;
-
-  // The history is a log, not state: a failed write is not retried.
-  if (!tlsHeapOk()) return next;
-  const char *stage = "";
-  int st = fbRequest("PUT", child, "", mem->body, stage);
-  if (st != 200) Serial.printf("[PHONESYNC] Sync history not written (HTTP %d %s)\n", st, st ? "" : stage);
+  const char *status = (run.stuck || run.unsaved) ? "incomplete" : (c.rejected > 0 ? "partial" : "success");
+  if (!run.stuck && !run.unsaved)
+    q.state("Synced: %d added, %d updated, %d removed, %d rejected", c.added, c.updated, c.removed, c.rejected);
+  writeHistory(q.type, status, c);
   return next;
 }
 
-static PhRes phonePass() {
-  if (!phPassActive) {
-    if (phClearFlag) {
-      // Cleared before the queue is read: anything queued from now on sets it again.
-      if (!tlsHeapOk()) return PhRes::Heap;
-      const char *stage = "";
-      int st = fbRequest("PUT", "tobesynced", "", "false", stage);
-      if (st != 200) return phFailed("Clearing tobesynced", st, stage);
-      phClearFlag = false;
-    }
-    phPassActive = true;
-    phStuck      = false;
-    phUnsaved    = false;
-    phCursor[0]  = '\0';
-    phCounts     = {};
-    phPageSize   = PH_PAGE;
-    setPhState("Reading the sync queue");
+static PhRes queuePass(const QueueSpec &q, QueueRun &run) {
+  if (!run.active) {
+    run.active    = true;
+    run.stuck     = false;
+    run.unsaved   = false;
+    run.cursor[0] = '\0';
+    run.counts    = {};
+    run.pageSize  = q.page;
+    q.state("Reading the sync queue");
   }
-
-  PhoneOp *ops = static_cast<PhoneOp *>(malloc(sizeof(PhoneOp) * (PH_PAGE + 1)));
+  void *ops = malloc(q.opSize * (q.page + 1));
   if (!ops) return PhRes::Heap;
   PhRes r = PhRes::Ok;
   bool done = false;
-  for (int pages = 0; pages < PH_PAGES_PER_GO && !done && r == PhRes::Ok; pages++) r = phonePage(ops, done);
+  for (int pages = 0; pages < SY_PAGES_PER_GO && !done && r == PhRes::Ok; pages++) r = queuePage(q, run, ops, done);
+  memset(ops, 0, q.opSize * (q.page + 1));   // user ops carry password hashes
   free(ops);
   if (r != PhRes::Ok || !done) return r;   // the rest next time, after any heartbeat
-  return phoneFinishPass();
+  return finishPass(q, run);
 }
 
-static bool phoneDue(unsigned long now) {
-  if ((long)(now - phNextWorkMs) < 0) return false;
+// ---- network settings ----
+
+static PhRes networkCheck() {
+  if (!tlsHeapOk()) return PhRes::Heap;
+  const char *stage = "";
+  int st = fbRequest("GET", "tobesyncednetwork", "", "", stage);
+  if (st != 200) return syFailed(setNwState, "Reading the network settings", st, stage);
+  syMarkOk();
+
+  NetworkRequest req;
+  if (!cloudParseNetworkRequest(cloudHttpBody(mem->resp), req)) {
+    setNwState("Queued network settings could not be read");
+    return PhRes::Ok;
+  }
+  if (!req.present || req.rejected) {
+    if (!req.present) setNwState(netRestartPending ? "Saved; restarts once no phone is connected" : "Up to date");
+    return PhRes::Ok;
+  }
+
+  SyncCounts c = {};
+  c.entries = 1;
+  if (!req.valid) {
+    char body[160];
+    snprintf(body, sizeof(body), "{\"status\":\"rejected\",\"reason\":\"%s\"}", req.reason);   // reason: fixed text
+    if (!tlsHeapOk()) return PhRes::Heap;
+    st = fbRequest("PATCH", "tobesyncednetwork", "", body, stage);
+    if (st != 200) return syFailed(setNwState, "Rejecting the network settings", st, stage);
+    setNwState("Rejected: %s", req.reason);
+    c.rejected = 1;
+    writeHistory("network", "partial", c);
+    return PhRes::Ok;
+  }
+
+  int staged = 0;
+  bool ran = runOnLoop(JOB_NETWORK, &req, 0, 1, 0, staged);
+  memset(req.wifiPassword, 0, sizeof(req.wifiPassword));
+  if (!ran) {
+    setNwState("Waiting for the PLC main loop");
+    return PhRes::Retry;
+  }
+  if (staged < 0) {
+    setNwState("Could not save the network settings on the PLC; retrying");
+    return PhRes::Retry;
+  }
+  if (!tlsHeapOk()) return PhRes::Heap;
+  st = fbRequest("DELETE", "tobesyncednetwork", "", "", stage);
+  if (st != 200) return syFailed(setNwState, "Confirming the network settings", st, stage);
+  if (staged == 0) {
+    setNwState("Network settings already in use");
+  } else {
+    setNwState("Saved; restarts once no phone is connected");
+    c.updated = 1;
+    writeHistory("network", "success", c);
+  }
+  return PhRes::Ok;
+}
+
+static PhRes syncPoll() {
+  if (!tlsHeapOk()) return PhRes::Heap;
+  const char *stage = "";
+  int st = fbRequest("GET", "tobesynced", "", "", stage);
+  if (st != 200) return syFailed(setPhState, "Checking for a sync request", st, stage);
+  syMarkOk();
+  const char *body = cloudHttpBody(mem->resp);
+  if (body && strncmp(body, "true", 4) == 0) {
+    syClearFlag   = true;
+    phRun.pending = true;
+    usRun.pending = true;
+    syNetPending  = true;
+  }
+  return PhRes::Ok;
+}
+
+static bool outboxWaiting(bool phones) {
   taskENTER_CRITICAL(&mux);
-  bool outbox = phOutboxCount > 0 || phOutboxOverflow;
+  bool w = phones ? phOutboxCount > 0 : usOutboxCount > 0;
+  if (phones && phOutboxOverflow) {
+    syReconcilePhones = true;
+    phOutboxOverflow  = false;
+  }
+  if (!phones && usOutboxOverflow) {
+    syReconcileUsers = true;
+    usOutboxOverflow = false;
+  }
   taskEXIT_CRITICAL(&mux);
-  return phReconcilePending || outbox || phPassPending || (long)(now - phNextPollMs) >= 0;
+  return w;
+}
+
+static bool syncDue(unsigned long now) {
+  if ((long)(now - syNextWorkMs) < 0) return false;
+  bool out = outboxWaiting(true) | outboxWaiting(false);
+  return syReconcilePhones || syReconcileUsers || out || syClearFlag || phRun.pending || usRun.pending || syNetPending ||
+         (long)(now - syNextPollMs) >= 0;
 }
 
 // One job per call, so the heartbeat is never held up for long.
-static void phoneStep() {
+static void syncStep() {
   PhRes r;
-  taskENTER_CRITICAL(&mux);
-  bool outbox = phOutboxCount > 0 || phOutboxOverflow;
-  taskEXIT_CRITICAL(&mux);
-
-  if (phReconcilePending) {
-    r = phoneReconcile();
-    if (r == PhRes::Ok) phReconcilePending = false;
-  } else if (outbox) {
-    r = phoneFlushOutbox();
-  } else if (phPassPending) {
-    r = phonePass();
+  if (syReconcilePhones) {
+    r = reconcile(PHONE_LIST);
+    if (r == PhRes::Ok) syReconcilePhones = false;
+  } else if (syReconcileUsers) {
+    r = reconcile(USER_LIST);
+    if (r == PhRes::Ok) syReconcileUsers = false;
+  } else if (outboxWaiting(true)) {
+    r = flushPhoneOutbox();
+  } else if (outboxWaiting(false)) {
+    r = flushUserOutbox();
+  } else if (syClearFlag) {
+    // Cleared before the queues are read: anything queued from now on sets it again.
+    if (!tlsHeapOk()) {
+      r = PhRes::Heap;
+    } else {
+      const char *stage = "";
+      int st = fbRequest("PUT", "tobesynced", "", "false", stage);
+      r = st == 200 ? PhRes::Ok : syFailed(setPhState, "Clearing tobesynced", st, stage);
+      if (r == PhRes::Ok) syClearFlag = false;
+    }
+  } else if (phRun.pending) {
+    r = queuePass(PHONE_QUEUE, phRun);
+  } else if (usRun.pending) {
+    r = queuePass(USER_QUEUE, usRun);
+  } else if (syNetPending) {
+    r = networkCheck();
+    if (r == PhRes::Ok) syNetPending = false;
   } else {
-    phNextPollMs = millis() + PH_POLL_MS;
-    r = phonePoll();
+    syNextPollMs = millis() + SY_POLL_MS;
+    r = syncPoll();
   }
 
-  unsigned long wait = PH_NEXT_MS;
+  unsigned long wait = SY_NEXT_MS;
   if (r == PhRes::Heap) wait = HEAP_RETRY_MS;
-  else if (r == PhRes::Retry) wait = PH_RETRY_MS;
+  else if (r == PhRes::Retry) wait = SY_RETRY_MS;
   else if (r == PhRes::Rejected) wait = RETRY_MAX_MS;
-  phNextWorkMs = millis() + wait;
+  syNextWorkMs = millis() + wait;
 }
 
 // Takes up memory the first time a configured PLC needs it.
@@ -894,6 +1233,7 @@ static void cloudStep() {
   static unsigned long tokenAtMs    = 0;
   static uint32_t      failStreak   = 0;
   static uint32_t      fbFailStreak = 0;
+  static unsigned long fbLastTryMs  = 0;
 
   unsigned long now = millis();
 
@@ -918,13 +1258,17 @@ static void cloudStep() {
     if (!cloudParseDbHost(fb.dbUrl, fbHost, sizeof(fbHost))) fbHost[0] = '\0';
     fbFailStreak = 0;
     nextFbMs = now;
-    // New settings (or boot): compare the lists and read the queue afresh.
-    phReconcilePending = true;
-    phPassPending      = true;
-    phPassActive       = false;
-    phClearFlag        = false;
-    phNextPollMs       = now;
-    phNextWorkMs       = now;
+    // New settings (or boot): compare the lists and read the queues afresh.
+    syReconcilePhones = true;
+    syReconcileUsers  = true;
+    syNetPending      = true;
+    syClearFlag       = false;
+    phRun.pending     = true;
+    phRun.active      = false;
+    usRun.pending     = true;
+    usRun.active      = false;
+    syNextPollMs      = now;
+    syNextWorkMs      = now;
   }
 
   // Firestore needs a project in the build; the Realtime Database push does not.
@@ -934,6 +1278,8 @@ static void cloudStep() {
   if (!fbOn) {
     setFbState("%s", fb.enabled ? "Settings incomplete" : (fb.deviceId[0] ? "Disabled" : "Not configured"));
     setPhState("Off: Firebase push is not enabled");
+    setUsState("Off: Firebase push is not enabled");
+    setNwState("Off: Firebase push is not enabled");
   }
   if (!fsOn && !fbOn) return;
 
@@ -943,6 +1289,8 @@ static void cloudStep() {
     if (fbOn) {
       setFbState("%s", msg);
       setPhState("%s", msg);
+      setUsState("%s", msg);
+      setNwState("%s", msg);
     }
   };
 
@@ -971,8 +1319,13 @@ static void cloudStep() {
 
   bool fsDue = fsOn && (long)(now - nextBeatMs) >= 0;
   bool fbDue = fbOn && (long)(now - nextFbMs) >= 0;
-  // Phone sync only fills the gaps: never in the same step as a heartbeat.
-  bool phDue = fbOn && !fsDue && !fbDue && phoneDue(now);
+  if (fbOn && !fbDue && fbFailStreak == 0 && now - fbLastTryMs >= FB_LIVE_GAP_MS) {
+    taskENTER_CRITICAL(&mux);
+    fbDue = fbLiveDirty;   // pushed early; the next heartbeat is counted from this push
+    taskEXIT_CRITICAL(&mux);
+  }
+  // The sync only fills the gaps: never in the same step as a heartbeat.
+  bool phDue = fbOn && !fsDue && !fbDue && syncDue(now);
   if (!fsDue && !fbDue && !phDue) return;
 
   int lease = Ethernet.maintain();
@@ -996,13 +1349,13 @@ static void cloudStep() {
     }
     if (phDue) {
       setPhState("%s", msg);
-      phNextWorkMs = now + HEAP_RETRY_MS;
+      syNextWorkMs = now + HEAP_RETRY_MS;
     }
     return;
   }
 
   if (phDue) {
-    phoneStep();
+    syncStep();
     return;
   }
 
@@ -1038,6 +1391,7 @@ static void cloudStep() {
   }
 
   if (fbDue && ESP.getFreeHeap() >= TLS_MIN_FREE_HEAP && ESP.getMaxAllocHeap() >= TLS_MIN_LARGEST) {
+    fbLastTryMs = millis();
     Outcome outcome = sendFirebasePush();
     if (outcome == Outcome::Ok) {
       fbFailStreak = 0;
@@ -1134,6 +1488,7 @@ void cloudLinkBegin() {
 
 void cloudLinkPublish(const CloudStatus &status) {
   taskENTER_CRITICAL(&mux);
+  if (liveFieldsDiffer(sharedStatus, status)) fbLiveDirty = true;
   sharedStatus = status;
   taskEXIT_CRITICAL(&mux);
 }
@@ -1196,8 +1551,10 @@ void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info) {
   info.okCount    = fbOkCount;
   info.failCount  = fbFailCount;
   strlcpy(info.phoneState, phState, sizeof(info.phoneState));
-  info.phoneEverOk     = phEverOk;
-  info.phoneLastOkAgoS = phEverOk ? (millis() - phLastOkMs) / 1000UL : 0;
+  strlcpy(info.userState, usState, sizeof(info.userState));
+  strlcpy(info.networkState, nwState, sizeof(info.networkState));
+  info.phoneEverOk     = syEverOk;
+  info.phoneLastOkAgoS = syEverOk ? (millis() - syLastOkMs) / 1000UL : 0;
   taskEXIT_CRITICAL(&mux);
 
   info.enabled   = cfg.enabled;
@@ -1238,7 +1595,47 @@ void cloudLinkClearFirebase() {
   taskEXIT_CRITICAL(&mux);
 }
 
-// ---------------- phone list sync: loop() side ----------------
+
+// ---------------- sync with the web app: loop() side ----------------
+
+static void phoneRecord(PhoneOp &op, const Device &d) {
+  memset(&op, 0, sizeof(op));
+  if (!cloudPhoneKey(d.id, op.h.key, sizeof(op.h.key))) op.h.key[0] = '\0';   // skipped by the sender
+  strlcpy(op.phoneId, d.id, sizeof(op.phoneId));
+  strlcpy(op.owner, d.owner, sizeof(op.owner));
+  op.h.action = OP_ADD;
+}
+
+static void userRecord(UserOp &op, const User &u) {
+  memset(&op, 0, sizeof(op));
+  if (!cloudUserKey(u.email, op.h.key, sizeof(op.h.key))) op.h.key[0] = '\0';
+  strlcpy(op.email, u.email, sizeof(op.email));
+  strlcpy(op.name, u.name, sizeof(op.name));
+  strlcpy(op.role, u.role, sizeof(op.role));
+  op.accessType = u.accessType == ACCESS_TIMED ? 1 : 0;
+  op.startTs    = u.startTs;
+  op.endTs      = u.endTs;
+  op.h.action   = OP_ADD;   // never the password
+}
+
+// Appends the RTDB keys of `n` entries to `pool` (NUL-separated, `cap` bytes).
+// Key i belongs to entry i: one without a key gets "" (matches no web key), so
+// the indices stay those of JOB_RECORDS_*.
+template <class KeyOf>
+static int collectKeys(char *pool, size_t cap, int n, int max, KeyOf keyOf) {
+  size_t used = 0;
+  int count = 0;
+  for (int i = 0; i < n && count < max; i++) {
+    char key[QUEUE_KEY_MAX + 1];
+    if (!keyOf(i, key, sizeof(key))) key[0] = '\0';
+    size_t kl = strlen(key) + 1;
+    if (used + kl > cap) break;
+    memcpy(pool + used, key, kl);
+    used += kl;
+    count++;
+  }
+  return count;
+}
 
 void cloudLinkLoop() {
   if (jobState != JOB_REQUESTED) return;   // the usual case: one volatile read
@@ -1248,20 +1645,43 @@ void cloudLinkLoop() {
   if (mine) jobState = JOB_SERVING;   // from here on the network task waits for us
   uint8_t kind  = jobKind;
   void   *buf   = jobBuf;
+  int     start = jobStart;
   int     count = jobCount;
+  size_t  cap   = jobCap;
   taskEXIT_CRITICAL(&mux);
   if (!mine) return;
 
   int result = 0;
-  if (kind == JOB_APPLY) {
-    applyCloudPhoneOps(static_cast<PhoneOp *>(buf), count);
-    result = count;
-  } else {
-    LocalPhone *out = static_cast<LocalPhone *>(buf);
-    for (int i = 0; i < deviceCount && result < count; i++, result++) {
-      strlcpy(out[result].id, devices[i].id, sizeof(out[result].id));
-      strlcpy(out[result].owner, devices[i].owner, sizeof(out[result].owner));
+  switch (kind) {
+    case JOB_APPLY_PHONES:
+      applyCloudPhoneOps(static_cast<PhoneOp *>(buf), count);
+      result = count;
+      break;
+    case JOB_APPLY_USERS:
+      applyCloudUserOps(static_cast<UserOp *>(buf), count);
+      result = count;
+      break;
+    case JOB_KEYS_PHONES:
+      result = collectKeys(static_cast<char *>(buf), cap, deviceCount, count,
+                           [](int i, char *k, size_t c) { return cloudPhoneKey(devices[i].id, k, c); });
+      break;
+    case JOB_KEYS_USERS:
+      result = collectKeys(static_cast<char *>(buf), cap, userCount, count,
+                           [](int i, char *k, size_t c) { return cloudUserKey(users[i].email, k, c); });
+      break;
+    case JOB_RECORDS_PHONES:
+      for (int i = start; i < deviceCount && result < count; i++) phoneRecord(static_cast<PhoneOp *>(buf)[result++], devices[i]);
+      break;
+    case JOB_RECORDS_USERS:
+      for (int i = start; i < userCount && result < count; i++) userRecord(static_cast<UserOp *>(buf)[result++], users[i]);
+      break;
+    case JOB_NETWORK: {
+      const NetworkRequest *r = static_cast<const NetworkRequest *>(buf);
+      result = stageCloudNetwork(r->bleName, r->ssid, r->wifiPassword);
+      break;
     }
+    default:
+      break;
   }
 
   taskENTER_CRITICAL(&mux);
@@ -1281,15 +1701,48 @@ void cloudLinkPhoneChanged(const char *phoneId, const char *owner, bool removed)
   taskENTER_CRITICAL(&mux);
   enabled = fbSaved.enabled;
   if (enabled) {
-    if (phOutboxCount < PH_OUTBOX) {
+    if (phOutboxCount < SY_OUTBOX) {
       phOutbox[phOutboxCount++] = c;
       queued = true;
     } else {
-      phOutboxOverflow = true;   // adds come back with the next comparison
+      phOutboxOverflow = true;   // the lists are compared again instead
     }
   }
   taskEXIT_CRITICAL(&mux);
-  if (enabled && !queued)
-    Serial.printf("[PHONESYNC] Outbox full: %s of %s not sent to the web list%s\n", removed ? "removal" : "registration",
-                  c.phoneId, removed ? "" : " (added at the next comparison)");
+  if (enabled && !queued) Serial.printf("[PHONESYNC] Outbox full: the lists will be compared again\n");
+}
+
+static void queueUserChange(const UserChange &c) {
+  bool enabled, queued = false;
+  taskENTER_CRITICAL(&mux);
+  enabled = fbSaved.enabled;
+  if (enabled) {
+    if (usOutboxCount < SY_OUTBOX) {
+      usOutbox[usOutboxCount++] = c;
+      queued = true;
+    } else {
+      usOutboxOverflow = true;   // the lists are compared again instead
+    }
+  }
+  taskEXIT_CRITICAL(&mux);
+  if (enabled && !queued) Serial.printf("[USERSYNC] Outbox full: the lists will be compared again\n");
+}
+
+void cloudLinkUserChanged(const User *now, const char *removedEmail) {
+  if (removedEmail && removedEmail[0]) {
+    UserChange c = {};
+    strlcpy(c.email, removedEmail, sizeof(c.email));
+    c.removed = true;
+    queueUserChange(c);
+  }
+  if (now && now->email[0]) {
+    UserChange c = {};
+    strlcpy(c.email, now->email, sizeof(c.email));
+    strlcpy(c.name, now->name, sizeof(c.name));
+    strlcpy(c.role, now->role, sizeof(c.role));
+    c.accessType = now->accessType == ACCESS_TIMED ? 1 : 0;
+    c.startTs    = now->startTs;
+    c.endTs      = now->endTs;
+    queueUserChange(c);
+  }
 }

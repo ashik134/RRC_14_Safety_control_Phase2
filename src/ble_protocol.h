@@ -29,9 +29,26 @@
 //   session.end  PLC -> app, {"v":1,"t":"session.end","reason":"OUT_OF_TIME"}
 //   user.add     {"v":1,"t":"user.add","id":101,"name":..,"email":..,
 //                 "password":..,"role":"Operator","access":"perpetual"|"timed",
-//                 "from":"YYYY-MM-DDTHH:MM","to":".."}      (from/to for timed)
+//                 "from":"YYYY-MM-DDTHH:MM","to":"..",      (from/to for timed)
+//                 "emp":".."}                               (employee ID, optional)
 //                -> {"v":1,"t":"user.add","id":101,"ok":true}
 //                -> {"v":1,"t":"user.add","id":101,"ok":false,"error":CODE}
+//   user.list    {"v":1,"t":"user.list","id":7}       (JSON only, Admin only)
+//                -> user.item {"i":1,"name":..,"email":..,"emp":..,"access":..,
+//                   "from":..,"to":..} ... one per Operator, then
+//                   {"v":1,"t":"user.list","id":7,"ok":true,"count":n}
+//                -> {"v":1,"t":"user.list","id":7,"ok":false,"error":CODE}
+//                Sent as RAW encrypted bytes (like the event log), not hex: an
+//                item would not fit one notification as hex.
+//   user.update  {"v":1,"t":"user.update","id":8,"email":<current email>,
+//                 "name":..,"newEmail":..,"emp":..,"password":..,
+//                 "access":"perpetual"|"timed","from":..,"to":..}
+//                every field after "email" optional, at least one present
+//                -> {"v":1,"t":"user.update","id":8,"ok":true|false,"error":..}
+//   user.remove  {"v":1,"t":"user.remove","id":9,"email":..}
+//                -> {"v":1,"t":"user.remove","id":9,"ok":true|false,"error":..}
+//   user.list / user.update / user.remove have no legacy form, and only touch
+//   Operators: an Admin account is never listed, changed or removed this way.
 //   log.months   {"v":1,"t":"log.months"}
 //                -> log.month {"month":"YYYY-MM"} ... then log.end {"count":n}
 //   log.dates    {"v":1,"t":"log.dates","month":"YYYY-MM"}
@@ -45,6 +62,7 @@
 #include <ArduinoJson.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -53,8 +71,16 @@ namespace blep {
 
 constexpr int kVersion = 1;
 
-// The most plaintext the reply encryption takes (encryptAESGCM_packet).
+// The most plaintext a hex reply / event-log line is allowed to be.
 constexpr size_t kMaxPlain = 200;
+
+// The most plaintext of one user.item: what encryptAESGCM_raw() takes
+// (28 bytes of framing in a 256-byte buffer). Needs a peer MTU of
+// kMaxUserItem + 28 + 3.
+constexpr size_t kMaxUserItem = 228;
+
+// Employee ID: at most this many characters, from kEmpChars.
+constexpr size_t kMaxEmpId = 16;
 
 enum class ParseError : uint8_t {
   None,
@@ -194,6 +220,7 @@ inline std::string sessionEnd(const char *reason) {
 // validation to refuse as BAD_ACCESS), [from] / [to] empty unless sent.
 struct AddUserRequest {
   std::string id, name, email, password, role, access, from, to;
+  std::string emp;  // employee ID; empty when not sent
 };
 
 // [replyId] is the id to echo in a failure: the request's own once it has been
@@ -226,6 +253,8 @@ inline ParseError parseAddUser(const std::string &plain, AddUserRequest &out, ui
   JsonVariantConst tv = o["to"];
   if (fv.is<const char *>()) out.from = fv.as<const char *>(); else if (!fv.isNull()) return ParseError::BadFormat;
   if (tv.is<const char *>()) out.to = tv.as<const char *>(); else if (!tv.isNull()) return ParseError::BadFormat;
+  JsonVariantConst ev = o["emp"];
+  if (ev.is<const char *>()) out.emp = ev.as<const char *>(); else if (!ev.isNull()) return ParseError::BadFormat;
   return ParseError::None;
 }
 
@@ -244,6 +273,207 @@ inline std::string addUserFail(uint32_t id, const char *error) {
   doc["ok"] = false;
   doc["error"] = error;
   return detail::dump(doc);
+}
+
+// ------------------------------------------ user.list / user.update / user.remove
+
+// The "t" of a JSON request on the user-management characteristic, so main.cpp
+// can tell which parser to use. Empty, with [err] saying why, if the envelope
+// itself is not valid.
+inline std::string userRequestType(const std::string &plain, ParseError &err) {
+  JsonDocument doc;
+  err = ParseError::None;
+  if (!detail::envelope(plain, doc, err)) return std::string();
+  return detail::typeOf(doc.as<JsonObjectConst>());
+}
+
+namespace detail {
+
+// "id": 1 to 999,999,999, like user.add's.
+inline bool reqId(JsonObjectConst o, uint32_t &out) {
+  JsonVariantConst v = o["id"];
+  if (!v.is<uint32_t>()) return false;
+  const uint32_t id = v.as<uint32_t>();
+  if (id < 1 || id > 999999999u) return false;
+  out = id;
+  return true;
+}
+
+// An optional string field: absent or null leaves [has] false; a string sets
+// it. False only for a value of any other type.
+inline bool optStr(JsonObjectConst o, const char *key, bool &has, std::string &out) {
+  JsonVariantConst v = o[key];
+  has = false;
+  if (v.isNull()) return true;
+  if (!v.is<const char *>()) return false;
+  out = v.as<const char *>();
+  has = true;
+  return true;
+}
+
+}  // namespace detail
+
+// An employee ID as stored: empty (none), or up to kMaxEmpId of
+// A-Z a-z 0-9 space . _ / -, not starting or ending with a space.
+inline bool validEmpId(const std::string &s) {
+  if (s.size() > kMaxEmpId) return false;
+  if (!s.empty() && (s.front() == ' ' || s.back() == ' ')) return false;
+  for (unsigned char c : s) {
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == ' ' || c == '.' || c == '_' || c == '/' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+struct ListUsersRequest {
+  uint32_t id = 0;
+};
+
+inline ParseError parseListUsers(const std::string &plain, ListUsersRequest &out) {
+  JsonDocument doc;
+  ParseError err = ParseError::None;
+  if (!detail::envelope(plain, doc, err)) return err;
+  JsonObjectConst o = doc.as<JsonObjectConst>();
+  if (detail::typeOf(o) != "user.list" || !detail::reqId(o, out.id)) return ParseError::BadFormat;
+  return ParseError::None;
+}
+
+// What to change about the user whose current email is [email]. Only the
+// fields whose has* flag is set are changed. [access] is "P" / "T" like
+// AddUserRequest's (anything else is for main.cpp to refuse as BAD_ACCESS);
+// [from] / [to] come with it.
+struct UpdateUserRequest {
+  uint32_t id = 0;  // set as soon as it has been read, for the failure reply
+  std::string email;
+  bool hasName = false, hasNewEmail = false, hasEmp = false, hasPassword = false, hasAccess = false;
+  std::string name, newEmail, emp, password, access, from, to;
+};
+
+inline ParseError parseUpdateUser(const std::string &plain, UpdateUserRequest &out) {
+  JsonDocument doc;
+  ParseError err = ParseError::None;
+  if (!detail::envelope(plain, doc, err)) return err;
+  JsonObjectConst o = doc.as<JsonObjectConst>();
+  if (detail::typeOf(o) != "user.update" || !detail::reqId(o, out.id)) return ParseError::BadFormat;
+  if (!detail::str(o, "email", out.email)) return ParseError::BadFormat;
+
+  std::string access;
+  bool hasFrom = false, hasTo = false;
+  if (!detail::optStr(o, "name", out.hasName, out.name) ||
+      !detail::optStr(o, "newEmail", out.hasNewEmail, out.newEmail) ||
+      !detail::optStr(o, "emp", out.hasEmp, out.emp) ||
+      !detail::optStr(o, "password", out.hasPassword, out.password) ||
+      !detail::optStr(o, "access", out.hasAccess, access) ||
+      !detail::optStr(o, "from", hasFrom, out.from) ||
+      !detail::optStr(o, "to", hasTo, out.to)) {
+    return ParseError::BadFormat;
+  }
+  // A period only goes with an access type.
+  if (!out.hasAccess && (hasFrom || hasTo)) return ParseError::BadFormat;
+  if (out.hasAccess) out.access = (access == "perpetual") ? "P" : (access == "timed") ? "T" : access;
+  // Nothing to change is not a request.
+  if (!out.hasName && !out.hasNewEmail && !out.hasEmp && !out.hasPassword && !out.hasAccess) {
+    return ParseError::BadFormat;
+  }
+  return ParseError::None;
+}
+
+struct RemoveUserRequest {
+  uint32_t id = 0;
+  std::string email;
+};
+
+inline ParseError parseRemoveUser(const std::string &plain, RemoveUserRequest &out) {
+  JsonDocument doc;
+  ParseError err = ParseError::None;
+  if (!detail::envelope(plain, doc, err)) return err;
+  JsonObjectConst o = doc.as<JsonObjectConst>();
+  if (detail::typeOf(o) != "user.remove" || !detail::reqId(o, out.id)) return ParseError::BadFormat;
+  if (!detail::str(o, "email", out.email)) return ParseError::BadFormat;
+  return ParseError::None;
+}
+
+// The reply to user.list (at the end of the items), user.update or
+// user.remove: [error] null for success.
+inline std::string userReply(const char *type, uint32_t id, const char *error) {
+  JsonDocument doc;
+  detail::begin(doc, type);
+  doc["id"] = id;
+  doc["ok"] = (error == nullptr);
+  if (error) doc["error"] = error;
+  return detail::dump(doc);
+}
+
+inline std::string userListEnd(uint32_t id, uint32_t count) {
+  JsonDocument doc;
+  detail::begin(doc, "user.list");
+  doc["id"] = id;
+  doc["ok"] = true;
+  doc["count"] = count;
+  return detail::dump(doc);
+}
+
+// Seconds since 1970 on the PLC's own clock (no time zone) as
+// "YYYY-MM-DDTHH:MM", the form user.add takes them in.
+inline std::string moment(uint32_t ts) {
+  const uint32_t days = ts / 86400u, secs = ts % 86400u;
+  // Civil date from a day count (H. Hinnant's days_from_civil, inverted).
+  const uint32_t z = days + 719468u;
+  const uint32_t era = z / 146097u;
+  const uint32_t doe = z - era * 146097u;
+  const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+  const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+  const uint32_t mp = (5u * doy + 2u) / 153u;
+  const uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;
+  const uint32_t m = mp < 10u ? mp + 3u : mp - 9u;
+  const uint32_t y = yoe + era * 400u + (m <= 2u ? 1u : 0u);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04u-%02u-%02uT%02u:%02u", (unsigned)y, (unsigned)m, (unsigned)d,
+           (unsigned)(secs / 3600u), (unsigned)(secs / 60u % 60u));
+  return buf;
+}
+
+struct UserItem {
+  std::string name, email, emp;
+  bool timed = false;
+  uint32_t from = 0, to = 0;  // timed only
+};
+
+// One user.item. Never more than [maxPlain] bytes: a name that would take it
+// over (only possible when it is long and full of characters JSON escapes)
+// is cut, never through a UTF-8 sequence, and the item says "cut":true so the
+// app knows the name it shows is not the whole one. Empty if even without a
+// name it does not fit.
+inline std::string userItem(uint32_t i, const UserItem &u, size_t maxPlain = kMaxUserItem) {
+  std::string name = u.name;
+  bool cut = false;
+  auto build = [&]() -> std::string {
+    JsonDocument doc;
+    detail::begin(doc, "user.item");
+    doc["i"] = i;
+    doc["name"] = name;
+    doc["email"] = u.email;
+    if (!u.emp.empty()) doc["emp"] = u.emp;
+    doc["access"] = u.timed ? "timed" : "perpetual";
+    if (u.timed) {
+      doc["from"] = moment(u.from);
+      doc["to"] = moment(u.to);
+    }
+    if (cut) doc["cut"] = true;
+    return detail::dump(doc);
+  };
+
+  std::string out = build();
+  while (out.size() > maxPlain && !name.empty()) {
+    if (!cut) { cut = true; out = build(); }   // the flag takes room too
+    const size_t over = out.size() - maxPlain;
+    size_t keep = name.size() > over ? name.size() - over : 0;
+    while (keep > 0 && (static_cast<unsigned char>(name[keep]) & 0xC0) == 0x80) keep--;
+    name = name.substr(0, keep);
+    out = build();
+  }
+  return out.size() <= maxPlain ? out : std::string();
 }
 
 // ----------------------------------------------------------------- event log

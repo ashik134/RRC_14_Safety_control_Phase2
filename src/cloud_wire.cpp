@@ -444,6 +444,10 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.raw("{");
   o.plainUint("uptimeS", s.uptimeS);
   o.raw(",");
+  o.plainUint("freeHeap", s.freeHeap);
+  o.raw(",");
+  o.plainUint("minFreeHeap", s.minFreeHeap);
+  o.raw(",");
   o.plainBool("rtcOk", s.rtcOk);
   o.raw(",");
   o.plainBool("sdOk", s.sdOk);
@@ -463,11 +467,21 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.plainBool("bleAuth", s.bleAuth);
   o.raw(",");
   o.plainString("bleUser", s.bleUser);
+  o.raw("},");
+
+  // What the web app's Network Settings form shows (never the Wi-Fi password).
+  o.field("network");
+  o.raw("{");
+  o.plainString("bleName", s.bleName);
+  o.raw(",");
+  o.plainString("ssid", s.wifiSsid);
+  o.raw(",");
+  o.plainBool("restartPending", s.netRestartPending);
   o.raw("}}");
   return o.ok ? o.len : 0;
 }
 
-// ---------------- phone list sync ----------------
+// ---------------- sync with the web app ----------------
 
 bool cloudPhoneKey(const char *phoneId, char *out, size_t cap) {
   if (cap == 0) return false;
@@ -492,6 +506,45 @@ bool cloudPhoneKey(const char *phoneId, char *out, size_t cap) {
     out[i++] = bad ? '_' : (char)c;
   }
   out[n] = '\0';
+  return true;
+}
+
+bool cloudUserKey(const char *email, char *out, size_t cap) {
+  static const char kHex[] = "0123456789ABCDEF";
+  if (cap == 0) return false;
+  out[0] = '\0';
+  while (isSpace(*email)) email++;
+  size_t n = strlen(email);
+  while (n > 0 && isSpace(email[n - 1])) n--;
+  if (n == 0) return false;
+
+  const unsigned char *s = reinterpret_cast<const unsigned char *>(email);
+  size_t len = 0;
+  size_t i = 0;
+  while (i < n) {
+    size_t seq = utf8SeqLen(s + i);
+    if (seq > 1 && i + seq <= n) {   // valid non-ASCII: kept as is (only ASCII is lower-cased)
+      if (len + seq >= cap) return false;
+      memcpy(out + len, s + i, seq);
+      len += seq;
+      i += seq;
+      continue;
+    }
+    unsigned char c = s[i++];
+    if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+    bool esc = seq != 1 || c < 0x20 || c == 0x7F || c == '%' || c == '.' || c == '$' || c == '#' || c == '[' ||
+               c == ']' || c == '/';
+    if (esc) {
+      if (len + 3 >= cap) return false;
+      out[len++] = '%';
+      out[len++] = kHex[c >> 4];
+      out[len++] = kHex[c & 0x0F];
+    } else {
+      if (len + 1 >= cap) return false;
+      out[len++] = (char)c;
+    }
+  }
+  out[len] = '\0';
   return true;
 }
 
@@ -531,10 +584,10 @@ int cloudRtdbKeyCompare(const char *a, const char *b) {
   return c == 0 ? 0 : (c < 0 ? -1 : 1);
 }
 
-static void rejectOp(PhoneOp &op, const char *reason) {
-  op.outcome = PHONE_REJECTED;
-  strncpy(op.reason, reason, sizeof(op.reason) - 1);
-  op.reason[sizeof(op.reason) - 1] = '\0';
+static void rejectOp(QueueOpHead &h, const char *reason) {
+  h.outcome = OP_REJECTED;
+  strncpy(h.reason, reason, sizeof(h.reason) - 1);
+  h.reason[sizeof(h.reason) - 1] = '\0';
 }
 
 static const char *jsonStr(JsonVariantConst v) {
@@ -542,7 +595,35 @@ static const char *jsonStr(JsonVariantConst v) {
   return s ? s : "";
 }
 
-bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, int maxOps, PhoneQueuePage &page) {
+// Text the PLC can store in a user record: no control characters, DEL, '|'
+// (the BLE ADD_USER separator) or 0x1F (the NVS record separator), 1..max bytes.
+static bool cleanText(const char *s, size_t max) {
+  size_t n = strlen(s);
+  if (n == 0 || n > max) return false;
+  for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s); *p; p++) {
+    if (*p < 0x20 || *p == 0x7F || *p == '|') return false;
+  }
+  return true;
+}
+
+static bool b64urlChar(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+}
+
+// "$p1$" + 16 base64url + "$" + 32 base64url (password_hash.h).
+static bool passwordHashShape(const char *s) {
+  if (strlen(s) != (size_t)USER_HASH_LEN || strncmp(s, "$p1$", 4) != 0 || s[20] != '$') return false;
+  for (int i = 4; i < USER_HASH_LEN; i++) {
+    if (i != 20 && !b64urlChar(s[i])) return false;
+  }
+  return true;
+}
+
+// Walks one page of a queue: fills `page` and calls `take(key, value)` for each
+// entry the PLC should look at (not the cursor, not already rejected) while
+// there is room. `take` returns false if it did not use a slot.
+template <class Take>
+static bool walkPage(const char *body, const char *skipKey, int maxOps, QueuePage &page, Take take) {
   memset(&page, 0, sizeof(page));
   if (!body) return false;
 
@@ -558,7 +639,7 @@ bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, i
   for (JsonPairConst kv : doc.as<JsonObjectConst>()) {
     const char *key = kv.key().c_str();
     page.keys++;
-    if (strlen(key) > (size_t)PHONE_KEY_MAX) {
+    if (strlen(key) > (size_t)QUEUE_KEY_MAX) {
       page.keyTooLong = true;
       continue;
     }
@@ -567,68 +648,147 @@ bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, i
       page.haveLast = true;
     }
     if (skipKey && strcmp(key, skipKey) == 0) continue;
-
     JsonVariantConst v = kv.value();
     if (strcmp(jsonStr(v["status"]), "rejected") == 0) continue;   // waits for the web app to queue it again
     if (page.ops >= maxOps) continue;
-
-    PhoneOp &op = ops[page.ops++];
-    memset(&op, 0, sizeof(op));
-    strcpy(op.key, key);
-    op.outcome = PHONE_PENDING;
-
-    // The exact id the phone sends at login; the key only when the entry has none.
-    const char *rawId = jsonStr(v["phoneId"]);
-    if (!rawId[0]) rawId = key;
-    char id[PHONE_KEY_MAX + 1];
-    copyTrimmed(id, sizeof(id), rawId);
-
-    const char *action = jsonStr(v["action"]);
-    if (strcmp(action, "remove") == 0) {
-      op.action = PHONE_REMOVE;
-    } else if (action[0] == '\0' || strcmp(action, "add") == 0) {
-      op.action = PHONE_ADD;
-    } else {
-      rejectOp(op, "Unknown action");
-      continue;
-    }
-
-    if (!id[0]) {
-      rejectOp(op, "Phone ID missing");
-      continue;
-    }
-    if (strlen(id) > (size_t)PHONE_ID_MAX) {
-      rejectOp(op, "Phone ID longer than 40 characters");
-      continue;
-    }
-    strcpy(op.phoneId, id);
-
-    // The PLC keeps one owner field, shown as "Owner email" on its page.
-    const char *email = jsonStr(v["ownerEmail"]);
-    const char *name  = jsonStr(v["owner"]);
-    char owner[sizeof(op.owner)];
-    copyTrimmed(owner, sizeof(owner), email);
-    if (!owner[0]) copyTrimmed(owner, sizeof(owner), name);
-    strcpy(op.owner, owner);
+    if (take(key, v)) page.ops++;
   }
   return true;
 }
 
-size_t cloudBuildQueueResult(char *out, size_t cap, const PhoneOp *ops, int n, int &written) {
+// Sets h.action from the entry; false (and rejected) if the action is unknown.
+static bool readAction(QueueOpHead &h, JsonVariantConst v) {
+  const char *action = jsonStr(v["action"]);
+  if (strcmp(action, "remove") == 0) {
+    h.action = OP_REMOVE;
+  } else if (action[0] == '\0' || strcmp(action, "add") == 0) {
+    h.action = OP_ADD;
+  } else {
+    rejectOp(h, "Unknown action");
+    return false;
+  }
+  return true;
+}
+
+bool cloudParsePhoneQueue(const char *body, const char *skipKey, PhoneOp *ops, int maxOps, QueuePage &page) {
+  return walkPage(body, skipKey, maxOps, page, [&](const char *key, JsonVariantConst v) {
+    PhoneOp &op = ops[page.ops];
+    memset(&op, 0, sizeof(op));
+    strcpy(op.h.key, key);
+    op.h.outcome = OP_PENDING;
+    if (!readAction(op.h, v)) return true;
+
+    // The exact id the phone sends at login; the key only when the entry has none.
+    const char *rawId = jsonStr(v["phoneId"]);
+    if (!rawId[0]) rawId = key;
+    char id[QUEUE_KEY_MAX + 1];
+    copyTrimmed(id, sizeof(id), rawId);
+    if (!id[0]) {
+      rejectOp(op.h, "Phone ID missing");
+      return true;
+    }
+    if (strlen(id) > (size_t)PHONE_ID_MAX) {
+      rejectOp(op.h, "Phone ID longer than 40 characters");
+      return true;
+    }
+    strcpy(op.phoneId, id);
+
+    // The PLC keeps one owner field, shown as "Owner email" on its page.
+    char owner[sizeof(op.owner)];
+    copyTrimmed(owner, sizeof(owner), jsonStr(v["ownerEmail"]));
+    if (!owner[0]) copyTrimmed(owner, sizeof(owner), jsonStr(v["owner"]));
+    strcpy(op.owner, owner);
+    return true;
+  });
+}
+
+bool cloudParseUserQueue(const char *body, const char *skipKey, UserOp *ops, int maxOps, QueuePage &page) {
+  return walkPage(body, skipKey, maxOps, page, [&](const char *key, JsonVariantConst v) {
+    UserOp &op = ops[page.ops];
+    memset(&op, 0, sizeof(op));
+    strcpy(op.h.key, key);
+    op.h.outcome = OP_PENDING;
+    if (!readAction(op.h, v)) return true;
+
+    char email[QUEUE_KEY_MAX + 1];
+    copyTrimmed(email, sizeof(email), jsonStr(v["email"]));
+    if (!email[0]) {
+      rejectOp(op.h, "Email missing");
+      return true;
+    }
+    if (!cleanText(email, sizeof(op.email) - 1) || !strchr(email, '@')) {
+      rejectOp(op.h, "Email not valid");
+      return true;
+    }
+    strcpy(op.email, email);
+    if (op.h.action == OP_REMOVE) return true;
+
+    char name[QUEUE_KEY_MAX + 1];
+    copyTrimmed(name, sizeof(name), jsonStr(v["name"]));
+    if (!cleanText(name, sizeof(op.name) - 1)) {
+      rejectOp(op.h, "Name missing or not valid");
+      return true;
+    }
+    strcpy(op.name, name);
+
+    const char *role = jsonStr(v["role"]);
+    if (strcmp(role, "Admin") != 0 && strcmp(role, "Operator") != 0) {
+      rejectOp(op.h, "Role must be Admin or Operator");
+      return true;
+    }
+    strcpy(op.role, role);
+
+    const char *access = jsonStr(v["accessType"]);
+    if (strcmp(access, "timed") == 0) {
+      JsonVariantConst s = v["startTs"], e = v["endTs"];
+      if (!s.is<uint32_t>() || !e.is<uint32_t>() || s.as<uint32_t>() == 0 || e.as<uint32_t>() <= s.as<uint32_t>()) {
+        rejectOp(op.h, "Timed access needs From before To");
+        return true;
+      }
+      op.accessType = 1;
+      op.startTs = s.as<uint32_t>();
+      op.endTs   = e.as<uint32_t>();
+    } else if (access[0] == '\0' || strcmp(access, "perpetual") == 0) {
+      op.accessType = 0;
+    } else {
+      rejectOp(op.h, "Unknown access type");
+      return true;
+    }
+
+    const char *hash = jsonStr(v["passwordHash"]);
+    if (hash[0] && !passwordHashShape(hash)) {
+      rejectOp(op.h, "Password hash not valid");
+      return true;
+    }
+    strcpy(op.passwordHash, hash);
+
+    char from[QUEUE_KEY_MAX + 1];
+    copyTrimmed(from, sizeof(from), jsonStr(v["renameFrom"]));
+    if (from[0] && !cleanText(from, sizeof(op.renameFrom) - 1)) {
+      rejectOp(op.h, "Previous email not valid");
+      return true;
+    }
+    strcpy(op.renameFrom, from);
+    return true;
+  });
+}
+
+size_t cloudBuildQueueResult(char *out, size_t cap, const void *ops, size_t stride, int n, int &written) {
   written = 0;
   Out o = {out, cap, 0, cap > 0};
   o.raw("{");
-  for (int i = 0; i < n; i++) {
-    const PhoneOp &op = ops[i];
-    if (op.outcome == PHONE_PENDING) continue;
+  const unsigned char *p = static_cast<const unsigned char *>(ops);
+  for (int i = 0; i < n; i++, p += stride) {
+    const QueueOpHead &h = *reinterpret_cast<const QueueOpHead *>(p);
+    if (h.outcome == OP_PENDING) continue;
     if (written > 0) o.raw(",");
-    if (op.outcome == PHONE_REJECTED) {
-      o.pathField(op.key, "status");
+    if (h.outcome == OP_REJECTED) {
+      o.pathField(h.key, "status");
       o.raw("\"rejected\",");
-      o.pathField(op.key, "reason");
-      o.utf8Value(op.reason);
+      o.pathField(h.key, "reason");
+      o.utf8Value(h.reason);
     } else {
-      o.pathField(op.key, nullptr);
+      o.pathField(h.key, nullptr);
       o.raw("null");
     }
     written++;
@@ -647,45 +807,111 @@ size_t cloudBuildPhonelistPatch(char *out, size_t cap, const PhoneOp *ops, int n
   for (int i = 0; i < n; i++) {
     const PhoneOp &op = ops[i];
     if (i > 0) o.raw(",");
-    if (op.action == PHONE_REMOVE) {
-      o.pathField(op.key, nullptr);
+    if (op.h.action == OP_REMOVE) {
+      o.pathField(op.h.key, nullptr);
       o.raw("null");
       continue;
     }
-    o.pathField(op.key, "phoneId");
+    o.pathField(op.h.key, "phoneId");
     o.utf8Value(op.phoneId);
     if (op.owner[0]) {
       o.raw(",");
-      o.pathField(op.key, strchr(op.owner, '@') ? "ownerEmail" : "owner");
+      o.pathField(op.h.key, strchr(op.owner, '@') ? "ownerEmail" : "owner");
       o.utf8Value(op.owner);
     }
     o.raw(",");
-    o.pathField(op.key, "source");
+    o.pathField(op.h.key, "source");
     o.raw("\"plc\",");
-    o.pathField(op.key, "registeredAt");
+    o.pathField(op.h.key, "registeredAt");
     o.raw("{\".sv\":\"timestamp\"}");
   }
   o.raw("}");
   return o.ok ? o.len : 0;
 }
 
-bool cloudShallowHasKeys(const char *body, const char (*keys)[PHONE_ID_MAX + 1], int n, bool *present) {
-  for (int i = 0; i < n; i++) present[i] = false;
+size_t cloudBuildUserlistPatch(char *out, size_t cap, const UserOp *ops, int n) {
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  for (int i = 0; i < n; i++) {
+    const UserOp &op = ops[i];
+    if (i > 0) o.raw(",");
+    o.pathField(op.h.key, nullptr);
+    if (op.h.action == OP_REMOVE) {
+      o.raw("null");
+      continue;
+    }
+    o.raw("{\"email\":");
+    o.utf8Value(op.email);
+    o.raw(",\"name\":");
+    o.utf8Value(op.name);
+    o.raw(",");
+    o.plainString("role", op.role);
+    o.raw(",");
+    o.plainString("accessType", op.accessType == 1 ? "timed" : "perpetual");
+    o.raw(",");
+    o.plainUint("startTs", op.accessType == 1 ? op.startTs : 0);
+    o.raw(",");
+    o.plainUint("endTs", op.accessType == 1 ? op.endTs : 0);
+    o.raw(",\"source\":\"plc\",\"updatedAt\":{\".sv\":\"timestamp\"}}");
+  }
+  o.raw("}");
+  return o.ok ? o.len : 0;
+}
+
+size_t cloudBuildDeleteKeys(char *out, size_t cap, const char *const *keys, int n) {
+  Out o = {out, cap, 0, cap > 0};
+  o.raw("{");
+  for (int i = 0; i < n; i++) {
+    if (i > 0) o.raw(",");
+    o.pathField(keys[i], nullptr);
+    o.raw("null");
+  }
+  o.raw("}");
+  return o.ok ? o.len : 0;
+}
+
+bool cloudParseNetworkRequest(const char *body, NetworkRequest &req) {
+  memset(&req, 0, sizeof(req));
   if (!body) return false;
   JsonDocument doc;
   if (deserializeJson(doc, body)) return false;
-  if (doc.isNull()) return true;   // no phones on the web yet
+  if (doc.isNull()) return true;   // nothing queued
   if (!doc.is<JsonObjectConst>()) return false;
-  JsonObjectConst obj = doc.as<JsonObjectConst>();
-  for (int i = 0; i < n; i++) present[i] = !obj[keys[i]].isNull();
+  JsonObjectConst o = doc.as<JsonObjectConst>();
+  req.present  = true;
+  req.rejected = strcmp(jsonStr(o["status"]), "rejected") == 0;
+
+  auto fail = [&](const char *why) {
+    req.valid = false;
+    strncpy(req.reason, why, sizeof(req.reason) - 1);
+    return true;
+  };
+  char ble[QUEUE_KEY_MAX + 1], ssid[QUEUE_KEY_MAX + 1], pass[QUEUE_KEY_MAX + 1];
+  copyTrimmed(ble, sizeof(ble), jsonStr(o["bleName"]));
+  copyTrimmed(ssid, sizeof(ssid), jsonStr(o["ssid"]));
+  copyTrimmed(pass, sizeof(pass), jsonStr(o["wifiPassword"]));
+  // The limits of the PLC's own Network Settings page (handleNetConfigPost()).
+  size_t bl = strlen(ble), sl = strlen(ssid), pl = strlen(pass);
+  if (bl < 5 || bl > 10 || strncmp(ble, "RRC_", 4) != 0) return fail("BLE name must start with RRC_, 5-10 characters");
+  if (sl < 5 || sl > 10) return fail("Wi-Fi SSID must be 5-10 characters");
+  if (pl != 0 && (pl < 8 || pl > 10)) return fail("Wi-Fi password must be 8-10 characters");
+  for (const char *s : {(const char *)ble, (const char *)ssid, (const char *)pass}) {
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s); *p; p++) {
+      if (*p < 0x20 || *p == 0x7F) return fail("Control characters are not allowed");
+    }
+  }
+  strcpy(req.bleName, ble);
+  strcpy(req.ssid, ssid);
+  strcpy(req.wifiPassword, pass);
+  req.valid = true;
   return true;
 }
 
-size_t cloudBuildPhoneSyncRecord(char *out, size_t cap, const char *deviceId, const char *ts, const char *status,
-                                 const PhoneSyncCounts &c) {
+size_t cloudBuildSyncRecord(char *out, size_t cap, const char *type, const char *deviceId, const char *ts,
+                            const char *status, const SyncCounts &c) {
   Out o = {out, cap, 0, cap > 0};
   o.raw("{");
-  o.plainString("type", "phones");
+  o.plainString("type", type);
   o.raw(",");
   o.plainString("status", status);
   o.raw(",");

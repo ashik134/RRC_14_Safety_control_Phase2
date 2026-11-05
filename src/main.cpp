@@ -13,6 +13,7 @@
 #include "ble_protocol.h"   // JSON wire format of the login / user-management / event-log characteristics
 #include "eth_diag.h"       // W5500 Ethernet hardware detect (additive, diagnostic only)
 #include "cloud_link.h"     // Cloud heartbeat over Ethernet, in its own task
+#include "password_hash.h"  // stored user passwords are PBKDF2 hashes
 #include "spi_bus_switch.h" // GPIO4 picks the SD card or the W5500 on the shared bus
 #include "esp_log.h"
 #include <time.h>
@@ -33,7 +34,9 @@
 
 #define AUTH_TIMEOUT_MS  60000
 
-#define NET_NAME_MIN_LEN 6
+// Same limits as the Network Settings page (handleNetConfigPost()) and the web
+// app; at 6, a 5-character name saved there was replaced by the default at boot.
+#define NET_NAME_MIN_LEN 5
 #define NET_NAME_MAX_LEN 10
 #define WIFI_PASS_MIN_LEN 8
 #define WIFI_PASS_MAX_LEN 10
@@ -501,8 +504,10 @@ static SemaphoreHandle_t replyIvMutex = nullptr;
 
 // Encrypt plaintext into IV(12)|CIPHER|TAG(16) hex string (IV is replyIvCounter, incremented)
 static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) {
+  // 228 (blep::kMaxUserItem) is what encryptAESGCM_raw()'s 256-byte buffer
+  // holds with the 28 bytes of framing; hex replies stay far below it.
   size_t len = plain.size();
-  if (len > 200) return false;
+  if (len > blep::kMaxUserItem) return false;
 
   uint8_t ciphertext[256];
   uint8_t tag[16];
@@ -868,7 +873,10 @@ static const unsigned long HEARTBEAT_TIMEOUT_MS = 10000;
 
 // Users are stored one NVS string per user, key "u_<i>", with the fields
 // joined by the ASCII Unit Separator (0x1F):
-//   name US email US password US role US accessType US startTs US endTs
+//   name US email US password US role US accessType US startTs US endTs US empId
+// (records written before the employee ID existed have no last field; and
+// firmware that predates it reads "endTs US empId" as endTs, since strtoul
+// stops at the separator, so a downgrade keeps working.)
 // Packing a user into a single string takes ~3-4 NVS entries instead of the
 // 11 the old one-key-per-field layout needed, which is what lets this fit
 // 30 users in the board's small (20KB) NVS partition. Records written by
@@ -896,7 +904,13 @@ static void removeLegacyUserKeys(int i) {
   sprintf(key, "tts_%d",   i); prefs.remove(key);
 }
 
+// Bumped by every saveUsers(), i.e. by every change to the user list from
+// any source (web panel, web app, BLE): a user.list in progress that sees it
+// move stops, as what it was sending is no longer the list.
+volatile uint32_t userListRev = 0;
+
 bool saveUsers() {
+  userListRev++;
   bool ok = true;
   prefs.begin("bleusers", false);
   int oldCount = prefs.getInt("count", 0);
@@ -912,7 +926,8 @@ bool saveUsers() {
     rec += userFieldClean(users[i].role);     rec += USER_FIELD_SEP;
     rec += String((unsigned)users[i].accessType); rec += USER_FIELD_SEP;
     rec += String((unsigned long)users[i].startTs); rec += USER_FIELD_SEP;
-    rec += String((unsigned long)users[i].endTs);
+    rec += String((unsigned long)users[i].endTs); rec += USER_FIELD_SEP;
+    rec += userFieldClean(users[i].empId);
     if (prefs.putString(key, rec) == 0) ok = false;
   }
   // Drop records of users that no longer exist (deleted from the end of the list).
@@ -931,14 +946,20 @@ bool saveUsers() {
   return ok;
 }
 
-// Splits `rec` on USER_FIELD_SEP into exactly 7 fields; false if malformed.
-static bool parseUserRecord(const String &rec, String f[7]) {
+// Splits `rec` on USER_FIELD_SEP into 7 fields, or 8 when the record has the
+// employee ID (f[7] is "" otherwise); false if malformed.
+static bool parseUserRecord(const String &rec, String f[8]) {
   int start = 0;
+  f[7] = "";
   for (int k = 0; k < 7; k++) {
-    int end = (k < 6) ? rec.indexOf(USER_FIELD_SEP, start) : (int)rec.length();
-    if (end < 0) return false;
+    int end = rec.indexOf(USER_FIELD_SEP, start);
+    if (end < 0) {
+      if (k < 6) return false;
+      end = (int)rec.length();
+    }
     f[k] = rec.substring(start, end);
     start = end + 1;
+    if (k == 6 && end < (int)rec.length()) f[7] = rec.substring(start);
   }
   return true;
 }
@@ -954,7 +975,7 @@ void loadUsers() {
     memset(&u, 0, sizeof(u));
     char key[12];
     userKey(key, sizeof(key), i);
-    String f[7];
+    String f[8];
     if (prefs.isKey(key) && parseUserRecord(prefs.getString(key, ""), f)) {
       f[0].toCharArray(u.name,     sizeof(u.name));
       f[1].toCharArray(u.email,    sizeof(u.email));
@@ -963,6 +984,7 @@ void loadUsers() {
       u.accessType = (uint8_t)f[4].toInt();
       u.startTs    = (uint32_t)strtoul(f[5].c_str(), nullptr, 10);
       u.endTs      = (uint32_t)strtoul(f[6].c_str(), nullptr, 10);
+      f[7].toCharArray(u.empId,    sizeof(u.empId));
     } else {
       // Old one-key-per-field format.
       char ekey[12], pkey[12], nkey[12], rkey[12], akey[12], fkey[12], tkey[12];
@@ -998,9 +1020,21 @@ void loadUsers() {
   userCount = loaded;
   prefs.end();
 
+  // Passwords stored in plain text by older firmware are replaced by their hash
+  // (password_hash.h) here, so no plain-text password stays on the PLC.
+  int hashedNow = 0;
+  for (int i = 0; i < userCount; i++) {
+    if (pwIsHash(users[i].password)) continue;
+    char h[PW_STORED_LEN + 1];
+    if (pwHash(users[i].password, h, sizeof(h))) {
+      strlcpy(users[i].password, h, sizeof(users[i].password));
+      hashedNow++;
+    }
+  }
+
   // Migrate old-format records to the compact format right away.
-  if (legacyUserKeysPresent && userCount > 0) {
-    if (saveUsers()) Serial.println("Users migrated to compact NVS format");
+  if ((legacyUserKeysPresent || hashedNow > 0) && userCount > 0) {
+    if (saveUsers()) Serial.printf("Users saved in the current format (%d password(s) hashed)\n", hashedNow);
   }
 
   // Always ensure at least one Admin user exists in the list.
@@ -1014,7 +1048,8 @@ void loadUsers() {
     memset(&users[userCount], 0, sizeof(User));
     strncpy(users[userCount].name,     "Admin",         sizeof(users[0].name) - 1);
     strncpy(users[userCount].email,    "admin@plc.com", sizeof(users[0].email) - 1);
-    strncpy(users[userCount].password, "admin123",      sizeof(users[0].password) - 1);
+    if (!pwHash("admin123", users[userCount].password, sizeof(users[0].password)))
+      strncpy(users[userCount].password, "admin123", sizeof(users[0].password) - 1);   // converted at next boot
     strncpy(users[userCount].role,     "Admin",         sizeof(users[0].role) - 1);
     users[userCount].accessType = ACCESS_PERPETUAL;
     users[userCount].startTs    = 0;
@@ -1406,13 +1441,14 @@ static void applyOutputsDisconnected() {
 
 // Returns the matching user's index, or -1 if the credentials are wrong.
 // Credentials are valid only when the email matches a stored user exactly and
-// the password equals that user's stored password.
+// the password matches that user's stored hash. Only the user with that email
+// is hashed against, so a login costs one hash (password_hash.h).
 int checkCredentials(const std::string& email, const std::string& password) {
   for (int i = 0; i < userCount; i++) {
     // The Super Admin is a web-only role — never allowed on the BLE app.
     if (strcmp(users[i].role, "SuperAdmin") == 0) continue;
-    if (email == users[i].email && password == users[i].password) {
-      return i;
+    if (email == users[i].email) {
+      return pwVerify(password.c_str(), users[i].password) ? i : -1;
     }
   }
   return -1;
@@ -1996,13 +2032,55 @@ class HeartbeatCallbacks : public NimBLECharacteristicCallbacks {
 // Operator may add nobody. (The Super Admin has no BLE access.)
 // The BLE task only validates and queues the request; the flash write and
 // the final reply happen from loop(), like the SD login/logout events.
+//
+// JSON only (ble_protocol.h): user.list, user.update and user.remove let the
+// signed-in Admin see, change and remove OPERATORS. An Admin account is never
+// listed, changed or removed this way (FORBIDDEN), and only the fields listed
+// in UpdateUserRequest can change: never the role. Further reasons:
+// NOT_FOUND (no user has that email), EMP_EXISTS (another user has that
+// employee ID), CHANGED (the user list changed while it was being sent: ask
+// again), MTU_TOO_SMALL, ITEM_TOO_LONG. The user.list items and its final
+// reply are notified as RAW encrypted bytes (encryptAESGCM_raw), one per
+// loop() cycle like the event log; every other reply is hex as before.
 NimBLECharacteristic *userMgmtChar = nullptr;
+static SemaphoreHandle_t userTxMutex = nullptr;   // replies come from the BLE task and loop()
 
 volatile bool pendingAddUserFlag = false;
 char          pendingAddReqId[12] = "";
 bool          pendingAddJson = false;     // the request was a JSON user.add: reply in JSON
 User          pendingAddUser;
 String        pendingAddBy;
+
+enum UserMgmtOpType : uint8_t { UMOP_LIST, UMOP_UPDATE, UMOP_REMOVE };
+
+// A user.list / user.update / user.remove handed from the BLE task to loop().
+struct PendingUserMgmt {
+  UserMgmtOpType type;
+  uint32_t id;
+  char     email[64];      // whom (update / remove)
+  char     by[64];         // the Admin who asked
+  bool     hasName, hasNewEmail, hasEmp, hasPassword, hasAccess;
+  char     name[64], newEmail[64], emp[17], password[33];
+  uint8_t  accessType;
+  uint32_t startTs, endTs;
+};
+volatile bool   pendingUserMgmtFlag = false;
+PendingUserMgmt pendingUserMgmt;
+
+// user.list in progress (loop() only, read by the BLE task for BUSY).
+volatile bool   userListActive = false;
+static uint32_t userListId = 0;
+static int      userListNext = 0;      // next index of users[] to look at
+static uint32_t userListSent = 0;
+static uint32_t userListStartRev = 0;
+static char     userListBy[64] = "";
+
+static void notifyUserMgmt(const uint8_t *data, size_t len) {
+  if (userTxMutex) xSemaphoreTake(userTxMutex, portMAX_DELAY);
+  userMgmtChar->setValue(data, len);
+  userMgmtChar->notify();
+  if (userTxMutex) xSemaphoreGive(userTxMutex);
+}
 
 static void sendUserMgmtReply(const std::string &plain) {
   if (!userMgmtChar || !deviceConnected || !authenticated) return;
@@ -2011,9 +2089,131 @@ static void sendUserMgmtReply(const std::string &plain) {
     Serial.println("UserMgmt: reply encryption failed, notify skipped");
     return;
   }
-  userMgmtChar->setValue(outHex);
-  userMgmtChar->notify();
+  notifyUserMgmt((const uint8_t *)outHex.data(), outHex.size());
   Serial.printf("UserMgmt reply: %s\n", plain.c_str());
+}
+
+// The user.list notifications: raw IV|CIPHER|TAG bytes, half the size of hex.
+static void sendUserMgmtRaw(const std::string &plain) {
+  if (!userMgmtChar || !deviceConnected || !authenticated) return;
+  std::string raw;
+  if (!encryptAESGCM_raw(plain, raw)) {
+    Serial.println("UserMgmt: list packet encryption failed, notify skipped");
+    return;
+  }
+  notifyUserMgmt((const uint8_t *)raw.data(), raw.size());
+}
+
+// The failure reply of a user.list (raw) / user.update / user.remove (hex).
+static void sendUserMgmtFail(UserMgmtOpType type, uint32_t id, const char *reason) {
+  Serial.printf("UserMgmt: request %u refused — %s\n", (unsigned)id, reason);
+  if (type == UMOP_LIST) sendUserMgmtRaw(blep::userReply("user.list", id, reason));
+  else sendUserMgmtReply(blep::userReply(type == UMOP_UPDATE ? "user.update" : "user.remove", id, reason));
+}
+
+static bool userMgmtBusy() {
+  return pendingAddUserFlag || pendingUserMgmtFlag || userListActive;
+}
+
+// Whether another user than users[except] has employee ID [emp] (not empty).
+static bool empIdTaken(const char *emp, int except) {
+  if (!emp || !emp[0]) return false;
+  for (int i = 0; i < userCount; i++) {
+    if (i != except && String(users[i].empId).equalsIgnoreCase(emp)) return true;
+  }
+  return false;
+}
+
+// The signed-in BLE user is an Admin (the only one who may manage users).
+static bool callerIsAdmin() {
+  int callerIdx = findUserIndexByEmail(connectedUserEmail);
+  return callerIdx >= 0 && strcmp(users[callerIdx].role, "Admin") == 0;
+}
+
+static bool isCleanText(const std::string &s);
+
+// user.list / user.update / user.remove from the BLE task: checked for form
+// and permission here, queued for loop(), which decides against the user list
+// as it is then and replies.
+static void handleUserMgmtJson(const std::string &type, const std::string &plain) {
+  PendingUserMgmt op = {};
+  blep::ParseError pe = blep::ParseError::None;
+  if (type == "user.list") {
+    op.type = UMOP_LIST;
+    blep::ListUsersRequest req;
+    pe = blep::parseListUsers(plain, req);
+    op.id = req.id;
+  } else if (type == "user.update") {
+    op.type = UMOP_UPDATE;
+    blep::UpdateUserRequest req;
+    pe = blep::parseUpdateUser(plain, req);
+    op.id = req.id;
+    if (pe == blep::ParseError::None) {
+      if (req.email.empty() || req.email.size() >= sizeof(op.email) || !isCleanText(req.email) ||
+          (req.hasName && (req.name.empty() || req.name.size() > 32 || !isCleanText(req.name))) ||
+          (req.hasNewEmail && (req.newEmail.empty() || req.newEmail.size() > 40 ||
+                               req.newEmail.find('@') == std::string::npos || !isCleanText(req.newEmail))) ||
+          (req.hasEmp && !blep::validEmpId(req.emp)) ||
+          (req.hasPassword && (req.password.size() < 6 || req.password.size() > 32 || !isCleanText(req.password)))) {
+        sendUserMgmtFail(op.type, op.id, "BAD_FORMAT");
+        return;
+      }
+      if (req.hasAccess) {
+        if (req.access == "P") {
+          op.accessType = ACCESS_PERPETUAL;
+        } else if (req.access == "T") {
+          uint32_t from = 0, to = 0;
+          if (!parseDateTimeLocal(String(req.from.c_str()), from) ||
+              !parseDateTimeLocal(String(req.to.c_str()), to) || to <= from) {
+            sendUserMgmtFail(op.type, op.id, "BAD_ACCESS");
+            return;
+          }
+          op.accessType = ACCESS_TIMED;
+          op.startTs = from;
+          op.endTs = to;
+        } else {
+          sendUserMgmtFail(op.type, op.id, "BAD_ACCESS");
+          return;
+        }
+      }
+      strlcpy(op.email, req.email.c_str(), sizeof(op.email));
+      op.hasName = req.hasName;         strlcpy(op.name, req.name.c_str(), sizeof(op.name));
+      op.hasNewEmail = req.hasNewEmail; strlcpy(op.newEmail, req.newEmail.c_str(), sizeof(op.newEmail));
+      op.hasEmp = req.hasEmp;           strlcpy(op.emp, req.emp.c_str(), sizeof(op.emp));
+      op.hasPassword = req.hasPassword; strlcpy(op.password, req.password.c_str(), sizeof(op.password));
+      op.hasAccess = req.hasAccess;
+      std::fill(req.password.begin(), req.password.end(), '\0');
+    }
+  } else {
+    op.type = UMOP_REMOVE;
+    blep::RemoveUserRequest req;
+    pe = blep::parseRemoveUser(plain, req);
+    op.id = req.id;
+    if (pe == blep::ParseError::None) {
+      if (req.email.empty() || req.email.size() >= sizeof(op.email)) {
+        sendUserMgmtFail(op.type, op.id, "BAD_FORMAT");
+        return;
+      }
+      strlcpy(op.email, req.email.c_str(), sizeof(op.email));
+    }
+  }
+  if (pe != blep::ParseError::None) {
+    sendUserMgmtFail(op.type, op.id, pe == blep::ParseError::BadVersion ? "BAD_VERSION" : "BAD_FORMAT");
+    return;
+  }
+  if (!callerIsAdmin()) {
+    Serial.printf("UserMgmt: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
+    sendUserMgmtFail(op.type, op.id, "FORBIDDEN");
+    return;
+  }
+  if (userMgmtBusy()) {
+    sendUserMgmtFail(op.type, op.id, "BUSY");
+    return;
+  }
+  strlcpy(op.by, connectedUserEmail, sizeof(op.by));
+  pendingUserMgmt = op;
+  memset(op.password, 0, sizeof(op.password));
+  pendingUserMgmtFlag = true;      // set last: loop() starts processing now
 }
 
 // Replies, in the format of the request: JSON {"v":1,"t":"user.add","id":..,
@@ -2074,7 +2274,10 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
-    uint8_t decrypted[320];   // a JSON user.add with every field at its maximum is ~260 bytes
+    // A JSON user.update with every field at its maximum is ~300 bytes; the
+    // app sends one that long as raw bytes, as hex would not fit the 512-byte
+    // attribute.
+    uint8_t decrypted[480];
     size_t decryptedLen = 0;
     if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, sizeof(decrypted), &decryptedLen)) {
       Serial.println("UserMgmt: AES-GCM decryption failed");
@@ -2092,7 +2295,14 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
     const std::string plain = reinterpret_cast<char*>(decrypted);
     const bool json = blep::isJson(plain);
     std::vector<std::string> f;
+    std::string empId;   // JSON user.add only
     if (json) {
+      blep::ParseError typeErr;
+      const std::string type = blep::userRequestType(plain, typeErr);
+      if (type == "user.list" || type == "user.update" || type == "user.remove") {
+        handleUserMgmtJson(type, plain);
+        return;
+      }
       blep::AddUserRequest req;
       uint32_t replyId = 0;
       blep::ParseError pe = blep::parseAddUser(plain, req, replyId);
@@ -2110,6 +2320,7 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
       f.push_back(req.access);
       f.push_back(req.from);
       f.push_back(req.to);
+      empId = req.emp;
     } else {
       f = splitPipe(plain);
       if (f.size() != 9 || f[0] != "ADD_USER") {
@@ -2130,8 +2341,7 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
     const char *rid = reqId.c_str();
 
     // Permission: only a logged-in Admin may add users, and only Operators.
-    int callerIdx = findUserIndexByEmail(connectedUserEmail);
-    if (callerIdx < 0 || strcmp(users[callerIdx].role, "Admin") != 0) {
+    if (!callerIsAdmin()) {
       Serial.printf("UserMgmt: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
       sendAddUserFail(rid, "FORBIDDEN", json);
       return;
@@ -2141,7 +2351,8 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
     if (name.empty() || name.size() > 32 ||
         email.empty() || email.size() > 40 || email.find('@') == std::string::npos ||
         password.size() < 6 || password.size() > 32 ||
-        !isCleanText(name) || !isCleanText(email) || !isCleanText(password)) {
+        !isCleanText(name) || !isCleanText(email) || !isCleanText(password) ||
+        !blep::validEmpId(empId)) {
       sendAddUserFail(rid, "BAD_FORMAT", json);
       return;
     }
@@ -2176,11 +2387,15 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
       sendAddUserFail(rid, "EMAIL_EXISTS", json);
       return;
     }
+    if (empIdTaken(empId.c_str(), -1)) {
+      sendAddUserFail(rid, "EMP_EXISTS", json);
+      return;
+    }
     if (userCount >= MAX_USERS) {
       sendAddUserFail(rid, "MAX_USERS", json);
       return;
     }
-    if (pendingAddUserFlag) {       // previous request still waiting for loop()
+    if (userMgmtBusy()) {           // previous request still waiting for loop()
       sendAddUserFail(rid, "BUSY", json);
       return;
     }
@@ -2189,6 +2404,7 @@ class UserMgmtCallbacks : public NimBLECharacteristicCallbacks {
     strncpy(nu.email,    email.c_str(),    sizeof(nu.email) - 1);
     strncpy(nu.password, password.c_str(), sizeof(nu.password) - 1);
     strncpy(nu.role,     role.c_str(),     sizeof(nu.role) - 1);
+    strlcpy(nu.empId,    empId.c_str(),    sizeof(nu.empId));
     pendingAddUser = nu;
     strncpy(pendingAddReqId, rid, sizeof(pendingAddReqId) - 1);
     pendingAddReqId[sizeof(pendingAddReqId) - 1] = '\0';
@@ -2210,12 +2426,23 @@ static void processPendingAddUser() {
   strncpy(reqId, pendingAddReqId, sizeof(reqId));
   reqId[sizeof(reqId) - 1] = '\0';
   User nu = pendingAddUser;
+  memset(pendingAddUser.password, 0, sizeof(pendingAddUser.password));   // the app's plain-text password
   String by = pendingAddBy;
   const bool json = pendingAddJson;
 
+  // Stored as a hash only (password_hash.h).
+  char hashed[PW_STORED_LEN + 1];
+  bool hashedOk = pwHash(nu.password, hashed, sizeof(hashed));
+  memset(nu.password, 0, sizeof(nu.password));
+  if (hashedOk) strlcpy(nu.password, hashed, sizeof(nu.password));
+
   // The user list may have changed (web panel) since the request was queued.
-  if (findUserIndexByEmail(nu.email) >= 0) {
+  if (!hashedOk) {
+    sendAddUserFail(reqId, "STORAGE_FAIL", json);
+  } else if (findUserIndexByEmail(nu.email) >= 0) {
     sendAddUserFail(reqId, "EMAIL_EXISTS", json);
+  } else if (empIdTaken(nu.empId, -1)) {
+    sendAddUserFail(reqId, "EMP_EXISTS", json);
   } else if (userCount >= MAX_USERS) {
     sendAddUserFail(reqId, "MAX_USERS", json);
   } else {
@@ -2224,6 +2451,7 @@ static void processPendingAddUser() {
     if (saveUsers()) {
       Serial.printf("UserMgmt: user added from app — %s (%s) by %s\n", nu.email, nu.role, by.c_str());
       logEvent("USER_ADDED", String(nu.name) + " (" + String(nu.email) + ") added as " + String(nu.role) + " by " + by);
+      cloudLinkUserChanged(&users[userCount - 1], nullptr);   // shown in the web app's user list
       sendAddUserOk(reqId, json);
     } else {
       userCount--;                  // roll back: could not be stored persistently
@@ -2232,6 +2460,162 @@ static void processPendingAddUser() {
     }
   }
   pendingAddUserFlag = false;
+}
+
+// The signed-in BLE user is still [by], and still an Admin.
+static bool sameAdminSignedIn(const char *by) {
+  return deviceConnected && authenticated && String(connectedUserEmail).equalsIgnoreCase(by) && callerIsAdmin();
+}
+
+static void endUserList() {
+  userListActive = false;
+  userListBy[0] = '\0';
+}
+
+// One notification of the user.list in progress: the next Operator, or the
+// final reply. Called from loop().
+#define USER_LIST_PACKET_GAP_MS 15   // between two list notifications: never floods the BLE buffers
+
+static void stepUserList() {
+  if (!sameAdminSignedIn(userListBy)) { endUserList(); return; }   // nobody to send to
+  static unsigned long lastPacketMs = 0;
+  if (millis() - lastPacketMs < USER_LIST_PACKET_GAP_MS) return;
+  lastPacketMs = millis();
+  if (userListRev != userListStartRev) {
+    sendUserMgmtFail(UMOP_LIST, userListId, "CHANGED");
+    endUserList();
+    return;
+  }
+  while (userListNext < userCount && strcmp(users[userListNext].role, "Operator") != 0) userListNext++;
+  if (userListNext >= userCount) {
+    sendUserMgmtRaw(blep::userListEnd(userListId, userListSent));
+    Serial.printf("UserMgmt: listed %u operator(s)\n", (unsigned)userListSent);
+    endUserList();
+    return;
+  }
+  const User &u = users[userListNext];
+  blep::UserItem item;
+  item.name = u.name;
+  item.email = u.email;
+  item.emp = u.empId;
+  item.timed = u.accessType == ACCESS_TIMED;
+  item.from = u.startTs;
+  item.to = u.endTs;
+  const std::string msg = blep::userItem(userListSent + 1, item);
+  if (msg.empty()) {
+    sendUserMgmtFail(UMOP_LIST, userListId, "ITEM_TOO_LONG");
+    endUserList();
+    return;
+  }
+  // A notification longer than the link carries would arrive cut short.
+  const size_t need = msg.size() + 12 + 16 + 3;
+  if (pBLEServer && pBLEServer->getPeerMTU(connId) < need) {
+    Serial.printf("UserMgmt: MTU too small for the list (%u, need %u)\n",
+                  (unsigned)pBLEServer->getPeerMTU(connId), (unsigned)need);
+    sendUserMgmtFail(UMOP_LIST, userListId, "MTU_TOO_SMALL");
+    endUserList();
+    return;
+  }
+  sendUserMgmtRaw(msg);
+  userListSent++;
+  userListNext++;
+}
+
+// user.update, on loop()'s task: decided against the user list as it is now.
+static const char *applyUserUpdate(PendingUserMgmt &op) {
+  const int idx = findUserIndexByEmail(op.email);
+  if (idx < 0) return "NOT_FOUND";
+  if (strcmp(users[idx].role, "Operator") != 0) return "FORBIDDEN";   // Admins are not changed from the app
+  if (op.hasNewEmail) {
+    const int other = findUserIndexByEmail(op.newEmail);
+    if (other >= 0 && other != idx) return "EMAIL_EXISTS";
+  }
+  if (op.hasEmp && empIdTaken(op.emp, idx)) return "EMP_EXISTS";
+
+  char hashed[PW_STORED_LEN + 1] = "";
+  if (op.hasPassword) {
+    const bool hashedOk = pwHash(op.password, hashed, sizeof(hashed));
+    memset(op.password, 0, sizeof(op.password));
+    if (!hashedOk) return "STORAGE_FAIL";
+  }
+
+  const User before = users[idx];
+  User &u = users[idx];
+  if (op.hasName)     strlcpy(u.name, op.name, sizeof(u.name));
+  if (op.hasNewEmail) strlcpy(u.email, op.newEmail, sizeof(u.email));
+  if (op.hasEmp)      strlcpy(u.empId, op.emp, sizeof(u.empId));
+  if (op.hasPassword) strlcpy(u.password, hashed, sizeof(u.password));
+  if (op.hasAccess) {
+    u.accessType = op.accessType;
+    u.startTs = op.accessType == ACCESS_TIMED ? op.startTs : 0;
+    u.endTs   = op.accessType == ACCESS_TIMED ? op.endTs : 0;
+  }
+  memset(hashed, 0, sizeof(hashed));
+  if (!saveUsers()) {
+    users[idx] = before;   // as it was, in use and (best effort) stored
+    saveUsers();
+    return "STORAGE_FAIL";
+  }
+
+  String what;
+  if (op.hasName) what += " name";
+  if (op.hasNewEmail) what += " email";
+  if (op.hasEmp) what += " employee-ID";
+  if (op.hasPassword) what += " password";
+  if (op.hasAccess) what += op.accessType == ACCESS_TIMED ? " access(timed)" : " access(perpetual)";
+  Serial.printf("UserMgmt: user updated from app — %s by %s:%s\n", u.email, op.by, what.c_str());
+  logEvent("USER_UPDATED", String(u.name) + " (" + String(u.email) + ") changed:" + what + " by " + String(op.by));
+  const bool renamed = !String(before.email).equalsIgnoreCase(u.email);
+  cloudLinkUserChanged(&u, renamed ? before.email : nullptr);   // the web app's user list follows
+  return nullptr;
+}
+
+// user.remove, on loop()'s task.
+static const char *applyUserRemove(const PendingUserMgmt &op) {
+  const int idx = findUserIndexByEmail(op.email);
+  if (idx < 0) return "NOT_FOUND";
+  if (strcmp(users[idx].role, "Operator") != 0) return "FORBIDDEN";   // Admins are not removed from the app
+  const User removed = users[idx];
+  for (int j = idx; j < userCount - 1; j++) users[j] = users[j + 1];
+  userCount--;
+  memset(&users[userCount], 0, sizeof(User));
+  if (!saveUsers()) {
+    for (int j = userCount; j > idx; j--) users[j] = users[j - 1];   // put it back where it was
+    users[idx] = removed;
+    userCount++;
+    saveUsers();
+    return "STORAGE_FAIL";
+  }
+  Serial.printf("UserMgmt: user removed from app — %s by %s\n", removed.email, op.by);
+  logEvent("USER_REMOVED", String(removed.name) + " (" + String(removed.email) + ") removed by " + String(op.by));
+  cloudLinkUserChanged(nullptr, removed.email);   // taken out of the web app's user list too
+  return nullptr;
+}
+
+// Called from loop(): the queued user.list / user.update / user.remove.
+static void processPendingUserMgmt() {
+  if (userListActive) { stepUserList(); return; }
+  if (!pendingUserMgmtFlag) return;
+
+  PendingUserMgmt op = pendingUserMgmt;
+  memset(pendingUserMgmt.password, 0, sizeof(pendingUserMgmt.password));
+  // Only for the Admin who asked, while still signed in: nothing is changed
+  // for a session that has ended (the app reports that it cannot tell).
+  if (!sameAdminSignedIn(op.by)) {
+    Serial.println("UserMgmt: request dropped — its Admin is no longer signed in");
+  } else if (op.type == UMOP_LIST) {
+    userListId = op.id;
+    userListNext = 0;
+    userListSent = 0;
+    userListStartRev = userListRev;
+    strlcpy(userListBy, op.by, sizeof(userListBy));
+    userListActive = true;   // the items go out from the next loop() cycles
+  } else {
+    const char *error = op.type == UMOP_UPDATE ? applyUserUpdate(op) : applyUserRemove(op);
+    sendUserMgmtReply(blep::userReply(op.type == UMOP_UPDATE ? "user.update" : "user.remove", op.id, error));
+  }
+  memset(op.password, 0, sizeof(op.password));
+  pendingUserMgmtFlag = false;
 }
 
 // ---------------- EVENT LOG over BLE ----------------
@@ -2681,6 +3065,7 @@ void setup() {
   i2cMutex = xSemaphoreCreateMutex();
   replyIvMutex = xSemaphoreCreateMutex();
   logTxMutex = xSemaphoreCreateMutex();
+  userTxMutex = xSemaphoreCreateMutex();
 
   // RTC + SD event logging — optional peripherals; init failures are
   // logged but never halt the PLC (this is safety-critical control
@@ -2750,6 +3135,7 @@ void setup() {
   }
   Serial.printf("RTC after Ethernet init: %s\n", syncTimeCache() ? "OK" : "NOT RESPONDING");
 
+  pwSelfTest();   // the PLC and the web app must hash passwords the same way
   loadUsers();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
   loadInputConfig();   // reads NVS, applies pinMode INPUT for all 9 inputs
@@ -2879,7 +3265,35 @@ static void publishCloudStatus() {
   s.bleConn = deviceConnected;
   s.bleAuth = authenticated;
   strlcpy(s.bleUser, connectedUserEmail, sizeof(s.bleUser));
+  strlcpy(s.bleName, bleName, sizeof(s.bleName));
+  strlcpy(s.wifiSsid, wifiSsid, sizeof(s.wifiSsid));
+  s.netRestartPending = netRestartPending;
   cloudLinkPublish(s);
+}
+
+// Network settings from the web app (stageCloudNetwork()) take effect at a
+// restart. It is made only once no phone has been connected for
+// NET_RESTART_IDLE_MS (outputs are already off then, as for any disconnect),
+// and at least NET_RESTART_SETTLE_MS after the settings were saved, so the
+// network task can confirm them to the web app first. Until then the PLC runs
+// on as before; a power cycle applies them as well.
+static void restartForNetworkWhenIdle() {
+  static const unsigned long NET_RESTART_IDLE_MS   = 10000;
+  static const unsigned long NET_RESTART_SETTLE_MS = 20000;
+  static unsigned long idleSinceMs = 0;
+  if (!netRestartPending) return;
+  if (deviceConnected) {
+    idleSinceMs = 0;
+    return;
+  }
+  if (idleSinceMs == 0) idleSinceMs = millis() | 1;
+  if (millis() - idleSinceMs < NET_RESTART_IDLE_MS || millis() - netStagedAtMs < NET_RESTART_SETTLE_MS) return;
+
+  Serial.println("[NETSYNC] No phone connected: restarting to apply the new network settings");
+  logEvent("NETWORK_RESTART", "Restart to apply network settings from the web app");
+  forceAllOutputsOff();
+  delay(200);
+  ESP.restart();
 }
 
 void loop() {
@@ -3014,6 +3428,7 @@ void loop() {
 
   // Store a user queued by the app's ADD_USER command and send its reply.
   processPendingAddUser();
+  processPendingUserMgmt();
 
   // Event-log download for the app: one notification per loop cycle.
   processLogJob();
@@ -3045,7 +3460,8 @@ void loop() {
 
   if (cloudLinkRunning()) {
     publishCloudStatus();
-    cloudLinkLoop(); // phone list changes from the web app: devices[] is only changed here
+    cloudLinkLoop(); // phone/user changes from the web app: devices[] and users[] are only changed here
+    restartForNetworkWhenIdle();
   } else {
     ethDiagPoll(); // W5500 alive/link check, 1 Hz, non-blocking
   }

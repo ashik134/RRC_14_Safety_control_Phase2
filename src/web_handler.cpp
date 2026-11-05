@@ -3,6 +3,7 @@
 #include <SD.h>
 #include "web_logo.h"
 #include "cloud_link.h"
+#include "password_hash.h"
 
 // Drop-in replacement for webServer.send(...), used everywhere in this file
 // instead of calling it directly.
@@ -120,6 +121,28 @@ static int findDeviceIndex(const char *id)
   return -1;
 }
 
+// After a failed save: every decision of this call is withdrawn, rejections
+// included ("list full" may not hold once the batch is retried).
+static void withdrawDecisions(QueueOpHead *first, size_t stride, int n, uint32_t decided)
+{
+  unsigned char *p = reinterpret_cast<unsigned char *>(first);
+  for (int i = 0; i < n && i < 32; i++, p += stride)
+  {
+    if (decided & (1UL << i))
+    {
+      QueueOpHead &h = *reinterpret_cast<QueueOpHead *>(p);
+      h.outcome = OP_PENDING;
+      h.reason[0] = '\0';
+    }
+  }
+}
+
+static void rejectHead(QueueOpHead &h, const char *reason)
+{
+  h.outcome = OP_REJECTED;
+  strlcpy(h.reason, reason, sizeof(h.reason));
+}
+
 void applyCloudPhoneOps(PhoneOp *ops, int n)
 {
   // Kept so a registry that cannot be stored is put back exactly as it was:
@@ -128,32 +151,32 @@ void applyCloudPhoneOps(PhoneOp *ops, int n)
   if (!backup)
   {
     Serial.println("[PHONESYNC] No memory to apply phone changes; retried later");
-    return; // every op stays PHONE_PENDING
+    return; // every op stays OP_PENDING
   }
   memcpy(backup, devices, sizeof(devices));
   int backupCount = deviceCount;
 
   bool changed = false;
-  uint32_t decidedHere = 0; // ops this call gave an outcome (n is a page: at most 32)
+  uint32_t decided = 0;
   for (int i = 0; i < n && i < 32; i++)
   {
     PhoneOp &op = ops[i];
-    if (op.outcome != PHONE_PENDING)
+    if (op.h.outcome != OP_PENDING)
       continue;
-    decidedHere |= 1UL << i;
+    decided |= 1UL << i;
     int idx = findDeviceIndex(op.phoneId);
-    if (op.action == PHONE_REMOVE)
+    if (op.h.action == OP_REMOVE)
     {
       if (idx < 0)
       {
-        op.outcome = PHONE_ABSENT;
+        op.h.outcome = OP_ABSENT;
         continue;
       }
       for (int j = idx; j < deviceCount - 1; j++)
         devices[j] = devices[j + 1];
       deviceCount--;
       memset(&devices[deviceCount], 0, sizeof(Device));
-      op.outcome = PHONE_REMOVED;
+      op.h.outcome = OP_REMOVED;
       changed = true;
       continue;
     }
@@ -161,25 +184,26 @@ void applyCloudPhoneOps(PhoneOp *ops, int n)
     {
       if (strcmp(devices[idx].owner, op.owner) == 0)
       {
-        op.outcome = PHONE_UNCHANGED;
+        op.h.outcome = OP_UNCHANGED;
         continue;
       }
       strlcpy(devices[idx].owner, op.owner, sizeof(devices[idx].owner));
-      op.outcome = PHONE_UPDATED;
+      op.h.outcome = OP_UPDATED;
       changed = true;
       continue;
     }
     if (deviceCount >= MAX_DEVICES)
     {
-      op.outcome = PHONE_REJECTED;
-      snprintf(op.reason, sizeof(op.reason), "Phone list full (%d of %d)", deviceCount, MAX_DEVICES);
+      char why[48];
+      snprintf(why, sizeof(why), "Phone list full (%d of %d)", deviceCount, MAX_DEVICES);
+      rejectHead(op.h, why);
       continue;
     }
     memset(&devices[deviceCount], 0, sizeof(Device));
     strlcpy(devices[deviceCount].id, op.phoneId, sizeof(devices[deviceCount].id));
     strlcpy(devices[deviceCount].owner, op.owner, sizeof(devices[deviceCount].owner));
     deviceCount++;
-    op.outcome = PHONE_ADDED;
+    op.h.outcome = OP_ADDED;
     changed = true;
   }
 
@@ -189,28 +213,194 @@ void applyCloudPhoneOps(PhoneOp *ops, int n)
     memcpy(devices, backup, sizeof(devices));
     deviceCount = backupCount;
     saveDevices(); // best effort: put storage back in step with what is in use
-    // Every decision of this call is withdrawn, rejections included: "list
-    // full" may not hold once the batch is retried.
-    for (int i = 0; i < n && i < 32; i++)
-    {
-      if (decidedHere & (1UL << i))
-      {
-        ops[i].outcome = PHONE_PENDING;
-        ops[i].reason[0] = '\0';
-      }
-    }
+    withdrawDecisions(&ops[0].h, sizeof(PhoneOp), n, decided);
   }
   else if (changed)
   {
     for (int i = 0; i < n && i < 32; i++)
     {
       const PhoneOp &op = ops[i];
-      if (op.outcome == PHONE_ADDED || op.outcome == PHONE_UPDATED || op.outcome == PHONE_REMOVED)
-        Serial.printf("[PHONESYNC] %s %s (from the web app)\n",
-                      op.outcome == PHONE_ADDED ? "Registered" : (op.outcome == PHONE_UPDATED ? "Updated" : "Removed"), op.phoneId);
+      if (op.h.outcome == OP_ADDED || op.h.outcome == OP_UPDATED || op.h.outcome == OP_REMOVED)
+        Serial.printf("[PHONESYNC] %s phone %s (from the web app)\n",
+                      op.h.outcome == OP_ADDED ? "Registered" : (op.h.outcome == OP_UPDATED ? "Updated" : "Removed"), op.phoneId);
     }
   }
   free(backup);
+}
+
+static int adminCount()
+{
+  int n = 0;
+  for (int i = 0; i < userCount; i++)
+    n += strcmp(users[i].role, "Admin") == 0;
+  return n;
+}
+
+// The user record as the web app sends it; false if nothing would change.
+static bool userDiffers(const User &u, const UserOp &op)
+{
+  return strcmp(u.email, op.email) != 0 || strcmp(u.name, op.name) != 0 || strcmp(u.role, op.role) != 0 ||
+         u.accessType != op.accessType || (op.accessType == ACCESS_TIMED && (u.startTs != op.startTs || u.endTs != op.endTs)) ||
+         (op.passwordHash[0] && strcmp(u.password, op.passwordHash) != 0);
+}
+
+static void copyUserFields(User &u, const UserOp &op)
+{
+  strlcpy(u.email, op.email, sizeof(u.email));
+  strlcpy(u.name, op.name, sizeof(u.name));
+  strlcpy(u.role, op.role, sizeof(u.role));
+  u.accessType = op.accessType == ACCESS_TIMED ? ACCESS_TIMED : ACCESS_PERPETUAL;
+  u.startTs = u.accessType == ACCESS_TIMED ? op.startTs : 0;
+  u.endTs = u.accessType == ACCESS_TIMED ? op.endTs : 0;
+  if (op.passwordHash[0])
+    strlcpy(u.password, op.passwordHash, sizeof(u.password));
+}
+
+void applyCloudUserOps(UserOp *ops, int n)
+{
+  User *backup = static_cast<User *>(malloc(sizeof(users)));
+  if (!backup)
+  {
+    Serial.println("[USERSYNC] No memory to apply user changes; retried later");
+    return; // every op stays OP_PENDING
+  }
+  memcpy(backup, users, sizeof(users));
+  int backupCount = userCount;
+
+  bool changed = false;
+  uint32_t decided = 0;
+  for (int i = 0; i < n && i < 32; i++)
+  {
+    UserOp &op = ops[i];
+    if (op.h.outcome != OP_PENDING)
+      continue;
+    decided |= 1UL << i;
+
+    if (op.h.action == OP_REMOVE)
+    {
+      int idx = findUserIndexByEmail(op.email);
+      if (idx < 0)
+      {
+        op.h.outcome = OP_ABSENT;
+        continue;
+      }
+      // Without an Admin the PLC would bring back admin@plc.com / admin123.
+      if (strcmp(users[idx].role, "Admin") == 0 && adminCount() <= 1)
+      {
+        rejectHead(op.h, "Cannot remove the last Admin");
+        continue;
+      }
+      for (int j = idx; j < userCount - 1; j++)
+        users[j] = users[j + 1];
+      userCount--;
+      memset(&users[userCount], 0, sizeof(User));
+      op.h.outcome = OP_REMOVED;
+      changed = true;
+      continue;
+    }
+
+    // A rename names the user's current email; anything else is found by its own.
+    int idx = op.renameFrom[0] ? findUserIndexByEmail(op.renameFrom) : -1;
+    if (idx < 0)
+      idx = findUserIndexByEmail(op.email);
+    int other = findUserIndexByEmail(op.email);
+    if (idx >= 0 && other >= 0 && other != idx)
+    {
+      rejectHead(op.h, "Email already used by another user");
+      continue;
+    }
+
+    if (idx >= 0)
+    {
+      if (strcmp(users[idx].role, "Admin") == 0 && strcmp(op.role, "Admin") != 0 && adminCount() <= 1)
+      {
+        rejectHead(op.h, "Cannot demote the last Admin");
+        continue;
+      }
+      if (!userDiffers(users[idx], op))
+      {
+        op.h.outcome = OP_UNCHANGED;
+        continue;
+      }
+      copyUserFields(users[idx], op);
+      op.h.outcome = OP_UPDATED;
+      changed = true;
+      continue;
+    }
+
+    if (!op.passwordHash[0])
+    {
+      rejectHead(op.h, "A new user needs a password");
+      continue;
+    }
+    if (userCount >= MAX_USERS)
+    {
+      char why[48];
+      snprintf(why, sizeof(why), "User list full (%d of %d)", userCount, MAX_USERS);
+      rejectHead(op.h, why);
+      continue;
+    }
+    memset(&users[userCount], 0, sizeof(User));
+    copyUserFields(users[userCount], op);
+    userCount++;
+    op.h.outcome = OP_ADDED;
+    changed = true;
+  }
+
+  if (changed && !saveUsers())
+  {
+    Serial.println("[USERSYNC] Could not save the users; changes undone, retried later");
+    memcpy(users, backup, sizeof(users));
+    userCount = backupCount;
+    saveUsers(); // best effort: put storage back in step with what is in use
+    withdrawDecisions(&ops[0].h, sizeof(UserOp), n, decided);
+  }
+  else if (changed)
+  {
+    for (int i = 0; i < n && i < 32; i++)
+    {
+      const UserOp &op = ops[i];
+      if (op.h.outcome == OP_ADDED || op.h.outcome == OP_UPDATED || op.h.outcome == OP_REMOVED)
+        Serial.printf("[USERSYNC] %s user %s (from the web app)\n",
+                      op.h.outcome == OP_ADDED ? "Added" : (op.h.outcome == OP_UPDATED ? "Updated" : "Removed"), op.email);
+    }
+  }
+  memset(backup, 0, sizeof(users)); // it held the password hashes
+  free(backup);
+}
+
+// ---- Network settings from the web app (applied at the next idle restart) ----
+volatile bool netRestartPending = false;
+volatile unsigned long netStagedAtMs = 0;
+static char stagedBle[32] = "", stagedSsid[32] = "";
+
+int stageCloudNetwork(const char *ble, const char *ssid, const char *wifiPass)
+{
+  const char *pass = (wifiPass && wifiPass[0]) ? wifiPass : wifiPassword; // "" keeps the current one
+  // In use already (or already waiting for the restart): nothing to do.
+  bool sameAsRunning = strcmp(ble, bleName) == 0 && strcmp(ssid, wifiSsid) == 0 && strcmp(pass, wifiPassword) == 0;
+  if (sameAsRunning && !netRestartPending)
+    return 0;
+
+  if (!prefs.begin("netconfig", false))
+    return -1;
+  bool ok = prefs.putString("wifi_ssid", ssid) == strlen(ssid) && prefs.putString("wifi_password", pass) == strlen(pass) &&
+            prefs.putString("ble_name", ble) == strlen(ble);
+  prefs.end();
+  if (!ok)
+    return -1;
+  if (sameAsRunning)
+  {
+    // Back to what is running: no restart needed after all.
+    netRestartPending = false;
+    return 0;
+  }
+  strlcpy(stagedBle, ble, sizeof(stagedBle));
+  strlcpy(stagedSsid, ssid, sizeof(stagedSsid));
+  netStagedAtMs = millis();
+  netRestartPending = true;
+  Serial.printf("[NETSYNC] New network settings saved (BLE %s, Wi-Fi %s); restart once no phone is connected\n", ble, ssid);
+  return 1;
 }
 
 bool isDeviceRegistered(const char *id)
@@ -1456,7 +1646,7 @@ static void handleLoginPost()
   for (int i = 0; i < userCount; i++)
   {
     bool emailMatch = String(users[i].email).equalsIgnoreCase(username);
-    if (emailMatch && String(users[i].password) == password)
+    if (emailMatch && pwVerify(password.c_str(), users[i].password))
     {
       if (!isUserAccessAllowed(users[i]))
       {
@@ -2054,7 +2244,9 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
     html += kvItem("Last push", fb.everOk ? String((unsigned long)fb.lastOkAgoS) + " s ago" : String("None since boot"));
     html += kvItem("Pushes sent / failed", String((unsigned long)fb.okCount) + " / " + String((unsigned long)fb.failCount));
     html += kvItem("Phone sync", htmlEsc(String(fb.phoneState)));
-    html += kvItem("Last phone sync check", fb.phoneEverOk ? String((unsigned long)fb.phoneLastOkAgoS) + " s ago" : String("None since boot"));
+    html += kvItem("User sync", htmlEsc(String(fb.userState)));
+    html += kvItem("Network settings sync", htmlEsc(String(fb.networkState)));
+    html += kvItem("Last sync check", fb.phoneEverOk ? String((unsigned long)fb.phoneLastOkAgoS) + " s ago" : String("None since boot"));
     html += "</dl></div>";
     html += "<div class='card'>";
     html += "<form method='POST' action='/firebase'>";
@@ -2269,6 +2461,8 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
       html += alertHtml("success", "Network settings saved. Restarting device...");
     }
     html += alertHtml("info", "The device restarts automatically after saving new Bluetooth or Wi-Fi credentials. Reconnect to the new Wi-Fi network once it is back.");
+    if (netRestartPending)
+      html += alertHtml("info", "New settings from the web app are saved. The PLC restarts to apply them once no phone has been connected for 10 seconds. The values below are the ones in use until then.");
     html += "<form id='net-form' method='POST' action='/netconfig'>";
     html += "<div class='card'>";
     html += "<div class='form-row'>";
@@ -2492,9 +2686,21 @@ static void handleAddPost()
     sendSafe(400, "text/html", errorPage(accessErr, "/add"));
     return;
   }
+  if (password.length() < 6)
+  {
+    sendSafe(400, "text/html", errorPage("Password must be at least 6 characters.", "/add"));
+    return;
+  }
+  char hashed[PW_STORED_LEN + 1];
+  if (!pwHash(password.c_str(), hashed, sizeof(hashed)))
+  {
+    sendSafe(500, "text/html", errorPage("Could not secure the password. The user was not added.", "/add"));
+    return;
+  }
+  memset(&users[userCount], 0, sizeof(User));
   name.toCharArray(users[userCount].name, sizeof(users[userCount].name));
   email.toCharArray(users[userCount].email, sizeof(users[userCount].email));
-  password.toCharArray(users[userCount].password, sizeof(users[userCount].password));
+  strlcpy(users[userCount].password, hashed, sizeof(users[userCount].password));
   role.toCharArray(users[userCount].role, sizeof(users[userCount].role));
   users[userCount].accessType = newUser.accessType;
   users[userCount].startTs = newUser.startTs;
@@ -2509,6 +2715,7 @@ static void handleAddPost()
   }
   Serial.printf("Web: user added — %s (%s)\n", users[userCount - 1].email,
                 users[userCount - 1].accessType == ACCESS_TIMED ? "timed" : "perpetual");
+  cloudLinkUserChanged(&users[userCount - 1], nullptr); // shown in the web app's user list
   webServer.sendHeader("Location", "/?tab=users");
   sendSafe(303);
 }
@@ -2818,9 +3025,10 @@ static void handleEditGet()
           htmlEsc(String(users[idx].email)) + "' required></div>";
   html += "</div>";
   html += "<div class='form-row'>";
-  html += "<div class='form-group'><label for='edit-pass'>Password</label>"
-          "<input id='edit-pass' type='text' name='password' value='" +
-          htmlEsc(String(users[idx].password)) + "' minlength='6'></div>";
+  // Only a hash is stored, so the current password cannot be shown.
+  html += "<div class='form-group'><label for='edit-pass'>New password <span class='opt'>(optional)</span></label>";
+  html += passwordField("edit-pass", "password", "Leave blank to keep the current password", String(), "minlength='6'");
+  html += "</div>";
   html += "<div class='form-group'><label for='edit-role'>Role</label><select name='role' id='edit-role'>";
   const char *roles[] = {"Operator", "Admin"};
   int roleCount = (currentRole() == "SuperAdmin") ? 2 : 1; // Admins can only assign Operator
@@ -2885,18 +3093,35 @@ static void handleEditPost()
     sendSafe(400, "text/html", errorPage(accessErr, ("/edit?idx=" + String(idx)).c_str()));
     return;
   }
+  char hashed[PW_STORED_LEN + 1] = "";
+  if (password.length() > 0)
+  {
+    if (password.length() < 6)
+    {
+      sendSafe(400, "text/html", errorPage("Password must be at least 6 characters.", ("/edit?idx=" + String(idx)).c_str()));
+      return;
+    }
+    if (!pwHash(password.c_str(), hashed, sizeof(hashed)))
+    {
+      sendSafe(500, "text/html", errorPage("Could not secure the password. Nothing was changed.", "/?tab=users"));
+      return;
+    }
+  }
+  char oldEmail[sizeof(users[idx].email)];
+  strlcpy(oldEmail, users[idx].email, sizeof(oldEmail));
   name.toCharArray(users[idx].name, sizeof(users[idx].name));
   email.toCharArray(users[idx].email, sizeof(users[idx].email));
   role.toCharArray(users[idx].role, sizeof(users[idx].role));
   users[idx].accessType = newAccess.accessType;
   users[idx].startTs = newAccess.startTs;
   users[idx].endTs = newAccess.endTs;
-  if (password.length() > 0)
-  {
-    password.toCharArray(users[idx].password, sizeof(users[idx].password));
-  }
+  if (hashed[0])
+    strlcpy(users[idx].password, hashed, sizeof(users[idx].password));
   saveUsers();
   Serial.printf("Web: user edited — %s\n", users[idx].email);
+  // A changed email is a different record in the web app's user list.
+  bool renamed = !String(oldEmail).equalsIgnoreCase(users[idx].email);
+  cloudLinkUserChanged(&users[idx], renamed ? oldEmail : nullptr);
   webServer.sendHeader("Location", "/?tab=users");
   sendSafe(303);
 }
@@ -2935,12 +3160,16 @@ static void handleDeletePost()
   if (!webCanManageUser(idx))
     return;
   Serial.printf("Web: user deleted — %s\n", users[idx].email);
+  char removedEmail[sizeof(users[idx].email)];
+  strlcpy(removedEmail, users[idx].email, sizeof(removedEmail));
   for (int i = idx; i < userCount - 1; i++)
   {
     users[i] = users[i + 1];
   }
   userCount--;
+  memset(&users[userCount], 0, sizeof(User));
   saveUsers();
+  cloudLinkUserChanged(nullptr, removedEmail); // taken out of the web app's user list too
   webServer.sendHeader("Location", "/?tab=users");
   sendSafe(303);
 }
@@ -2969,19 +3198,9 @@ static void handleAccountGet()
     }
   }
   String subtitle = isBleUser ? "Change your name and password" : "Change your web panel login credentials";
-  // Current password, pre-filled as this form has always done. A signed-in BLE
-  // user who has vanished from the list gets an empty field, never the web admin's.
-  String curPassVal = "";
-  if (isBleUser)
-  {
-    int ui = findUserIndexByEmail(_se.c_str());
-    if (ui >= 0)
-      curPassVal = String(users[ui].password);
-  }
-  else
-  {
-    curPassVal = String(webAdminPass);
-  }
+  // The web admin's current password is pre-filled as this form has always
+  // done. A BLE user's is stored only as a hash, so they type it.
+  String curPassVal = isBleUser ? String() : String(webAdminPass);
   String html = pageHead("Account Settings", subtitle.c_str(), nullptr, "user");
   html += "<div class='card'>";
   html += "<div class='cell-user account-id'><span class='avatar'>" +
@@ -3054,11 +3273,12 @@ static void handleAccountPost()
       sendSafe(404, "text/html", errorPage("User session invalid.", "/account"));
       return;
     }
-    if (String(users[idx].password) != curPass)
+    if (!pwVerify(curPass.c_str(), users[idx].password))
     {
       sendSafe(401, "text/html", errorPage("Current password is incorrect.", "/account"));
       return;
     }
+    char hashed[PW_STORED_LEN + 1] = "";
     if (newPass.length() > 0)
     {
       if (newPass != cfmPass)
@@ -3071,11 +3291,17 @@ static void handleAccountPost()
         sendSafe(400, "text/html", errorPage("New password must be at least 6 characters.", "/account"));
         return;
       }
-      newPass.toCharArray(users[idx].password, sizeof(users[idx].password));
+      if (!pwHash(newPass.c_str(), hashed, sizeof(hashed)))
+      {
+        sendSafe(500, "text/html", errorPage("Could not secure the password. Nothing was changed.", "/account"));
+        return;
+      }
+      strlcpy(users[idx].password, hashed, sizeof(users[idx].password));
     }
     newUser.toCharArray(users[idx].name, sizeof(users[idx].name));
     saveUsers();
     Serial.printf("Web: user updated own account — %s\n", users[idx].email);
+    cloudLinkUserChanged(&users[idx], nullptr); // the name shows in the web app's user list
     webServer.sendHeader("Location", "/");
     sendSafe(303);
   }
