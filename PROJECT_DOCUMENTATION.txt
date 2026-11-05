@@ -991,6 +991,27 @@ Main features
  leave it blank (blank keeps it). The Super Admin's own web login is not a
  BLE user and is unchanged.
 
+ Event upload (src/cloud_link.cpp, the web app's "Events & Logs" section).
+ While the Firebase push is on, every logEvent() line is also queued for
+     bfa_logs/<Device ID>/<YYYY-MM>/<key>   {plc_ts, category, detail}
+ and every BLE login attempt, granted or refused, for
+     bfa_events/<Device ID>/<YYYY-MM>/<key>
+         {auth: 1 | 0, email, username, role, empId, phoneId, reason, plc_ts}
+ (reason: BAD_PASSWORD, BAD_EMAIL, OUT_OF_TIME, UNTRUSTED_DEVICE,
+ INVALID_ROLE; refused attempts are logged at most once every 3 s, like the
+ SD log, and `suppressed` counts the ones in between). key is
+ "YYYY-MM-DD_HH-MM-SS_NN": the PLC time plus a counter for events of the same
+ second. The sync slots of the network task upload them, up to 4 log lines and
+ 2 access events per root PATCH (/.json). The queue (20 log lines, 6 access
+ events, 5.5 KB) is kept in RTC slow memory, not in DRAM: in DRAM it held the
+ idle heap below TLS_MIN_FREE_HEAP and no TLS session could start. It is
+ cleared at every boot like normal RAM. If it fills while the database cannot be reached, the
+ oldest entries are dropped, and the next uploaded line carries "skipped": N
+ (they are still in the SD log). Events with no valid clock time, and events
+ from before Firebase was enabled, are not uploaded. Lines are queued even
+ when the SD card is not working. Status: web panel > System > Firebase
+ ("Event upload").
+
 
 ================================================================================
 19. OTA FIRMWARE UPDATE

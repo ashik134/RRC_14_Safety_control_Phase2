@@ -477,6 +477,20 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.plainString("ssid", s.wifiSsid);
   o.raw(",");
   o.plainBool("restartPending", s.netRestartPending);
+  o.raw("},");
+
+  // How the event upload is doing (the web app's Events & Logs shows it).
+  o.field("eventUpload");
+  o.raw("{");
+  o.plainString("state", s.evState);
+  o.raw(",");
+  o.plainUint("queued", s.evQueued);
+  o.raw(",");
+  o.plainUint("uploaded", s.evUploaded);
+  o.raw(",");
+  o.plainUint("noClock", s.evNoClock);
+  o.raw(",");
+  o.plainUint("dropped", s.evDropped);
   o.raw("}}");
   return o.ok ? o.len : 0;
 }
@@ -944,4 +958,108 @@ void cloudHistoryKey(const char *ts, unsigned long uptimeS, char *out, size_t ca
     out[i] = c == ':' ? '-' : (c == ' ' ? '_' : c);
   }
   out[i] = '\0';
+}
+
+// ---------------- event upload ----------------
+
+bool cloudEventKey(const char *ts, unsigned seq, char *out, size_t cap) {
+  if (cap > 0) out[0] = '\0';
+  if (!ts || strlen(ts) != 19 || seq > 99) return false;
+  // "YYYY-MM-DD HH:MM:SS"
+  static const char kShape[] = "dddd-dd-dd dd:dd:dd";
+  for (size_t i = 0; i < 19; i++) {
+    bool digit = ts[i] >= '0' && ts[i] <= '9';
+    if (kShape[i] == 'd' ? !digit : ts[i] != kShape[i]) return false;
+  }
+  int month = (ts[5] - '0') * 10 + (ts[6] - '0');
+  int day   = (ts[8] - '0') * 10 + (ts[9] - '0');
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  int n = snprintf(out, cap, "%.10s_%.2s-%.2s-%.2s_%02u", ts, ts + 11, ts + 14, ts + 17, seq);
+  if (n <= 0 || (size_t)n >= cap) {
+    if (cap > 0) out[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
+size_t cloudBuildRootPath(char *out, size_t cap, const char *secret) {
+  if (cap == 0) return 0;
+  out[0] = '\0';
+  if (!cloudValidDbSecret(secret)) return 0;
+  int n = snprintf(out, cap, "/.json?auth=%s", secret);
+  if (n > 0 && (size_t)n < cap) return (size_t)n;
+  memset(out, 0, cap);   // a cut-off path still held part of the secret
+  return 0;
+}
+
+// "node/deviceId/YYYY-MM/key": the field name of one event in the root PATCH.
+static void eventPath(Out &o, const char *node, const char *deviceId, const char *key) {
+  o.raw("\"");
+  o.raw(node);
+  o.raw("/");
+  o.raw(deviceId);
+  o.raw("/");
+  char month[8];
+  memcpy(month, key, 7);
+  month[7] = '\0';
+  o.raw(month);
+  o.raw("/");
+  o.raw(key);
+  o.raw("\":");
+}
+
+size_t cloudBuildEventsPatch(char *out, size_t cap, const char *deviceId, const CloudLogEntry *logs, int nLogs,
+                             const CloudAccessEntry *acc, int nAcc) {
+  if (!cloudValidDeviceId(deviceId) || nLogs + nAcc <= 0) return 0;
+  Out o = {out, cap, 0, cap > 0};
+  bool first = true;
+  o.raw("{");
+  for (int i = 0; i < nLogs; i++) {
+    const CloudLogEntry &e = logs[i];
+    if (strlen(e.key) < 7) return 0;
+    if (!first) o.raw(",");
+    first = false;
+    eventPath(o, "bfa_logs", deviceId, e.key);
+    o.raw("{");
+    o.plainString("plc_ts", e.ts);
+    o.raw(",");
+    o.plainString("category", e.category);
+    o.raw(",\"detail\":");
+    o.utf8Value(e.detail);
+    if (e.skipped) {
+      o.raw(",");
+      o.plainUint("skipped", e.skipped);
+    }
+    o.raw(",\"uploadedAt\":{\".sv\":\"timestamp\"}}");
+  }
+  for (int i = 0; i < nAcc; i++) {
+    const CloudAccessEntry &e = acc[i];
+    if (strlen(e.key) < 7) return 0;
+    if (!first) o.raw(",");
+    first = false;
+    eventPath(o, "bfa_events", deviceId, e.key);
+    o.raw("{");
+    o.plainUint("auth", e.authorized ? 1 : 0);
+    o.raw(",\"email\":");
+    o.utf8Value(e.email);
+    o.raw(",\"username\":");
+    o.utf8Value(e.name);
+    o.raw(",");
+    o.plainString("role", e.role);
+    o.raw(",\"empId\":");
+    o.utf8Value(e.empId);
+    o.raw(",\"phoneId\":");
+    o.utf8Value(e.phoneId);
+    o.raw(",");
+    o.plainString("reason", e.reason);
+    o.raw(",");
+    o.plainString("plc_ts", e.ts);
+    if (e.suppressed) {
+      o.raw(",");
+      o.plainUint("suppressed", e.suppressed);
+    }
+    o.raw(",\"uploadedAt\":{\".sv\":\"timestamp\"}}");
+  }
+  o.raw("}");
+  return o.ok ? o.len : 0;
 }

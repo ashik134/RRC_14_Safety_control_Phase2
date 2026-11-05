@@ -371,6 +371,8 @@ void sdCheckAfterFailedOpen() {
 void logEvent(const char* category, const String& detail) {
   String ts = currentTimestamp();
   Serial.printf("[EVENT] %s: %s | %s\n", ts.c_str(), category, detail.c_str());
+  // Also to the web app's full log, even when the SD card is not working.
+  cloudLinkLogEvent(ts.c_str(), category, detail.c_str());
 
   // Every call to a card that has stopped answering costs ~1.5 s of retries
   // inside the SD driver, and this runs on loop(): that long without sampling
@@ -825,6 +827,18 @@ volatile bool pendingLoginFailEvent = false;
 String        pendingLoginFailDetail;
 String        pendingLoginDetail;
 String        pendingLogoutDetail;
+// The same logins as structured fields, for the web app's access events
+// (cloudLinkAccessEvent()). Set with the detail strings above, read by loop().
+struct PendingAuth {
+  char email[64];
+  char name[64];
+  char role[16];
+  char empId[17];
+  char phoneId[41];
+  char reason[20];
+};
+PendingAuth pendingLoginAuth     = {};
+PendingAuth pendingLoginFailAuth = {};
 
 void forceAllOutputsOff() {
   I2CGuard _i2cGuard;
@@ -1729,6 +1743,13 @@ class AuthCallbacks : public NimBLECharacteristicCallbacks {
       }
       // okRole is part of ok, so the stored role here is exactly "Admin" or "Operator".
       pendingLoginDetail = userName + " (" + String(email.c_str()) + ") logged in as " + String(users[userIdx].role) + " from device " + String(deviceId.c_str());
+      PendingAuth &pa = pendingLoginAuth;
+      memset(&pa, 0, sizeof(pa));
+      strlcpy(pa.email, users[userIdx].email, sizeof(pa.email));
+      strlcpy(pa.name, users[userIdx].name, sizeof(pa.name));
+      strlcpy(pa.role, users[userIdx].role, sizeof(pa.role));
+      strlcpy(pa.empId, users[userIdx].empId, sizeof(pa.empId));
+      strlcpy(pa.phoneId, deviceId.c_str(), sizeof(pa.phoneId));
       pendingLoginEvent  = true;
     } else {
       authenticated = false;
@@ -1751,6 +1772,19 @@ class AuthCallbacks : public NimBLECharacteristicCallbacks {
         return o;
       };
       pendingLoginFailDetail = String(failReason) + " - email: " + cleanForLog(email) + ", device: " + cleanForLog(deviceId);
+      // For the web app: the same cleaned values, plus the stored user's
+      // name, role and employee ID when the email belongs to one.
+      PendingAuth &pf = pendingLoginFailAuth;
+      memset(&pf, 0, sizeof(pf));
+      strlcpy(pf.email, cleanForLog(email).c_str(), sizeof(pf.email));
+      strlcpy(pf.phoneId, cleanForLog(deviceId).c_str(), sizeof(pf.phoneId));
+      strlcpy(pf.reason, failReason, sizeof(pf.reason));
+      int known = okCreds ? userIdx : findUserIndexByEmail(email.c_str());
+      if (known >= 0) {
+        strlcpy(pf.name, users[known].name, sizeof(pf.name));
+        strlcpy(pf.role, users[known].role, sizeof(pf.role));
+        strlcpy(pf.empId, users[known].empId, sizeof(pf.empId));
+      }
       pendingLoginFailEvent  = true;
     }
 
@@ -3399,6 +3433,8 @@ void loop() {
   if (pendingLoginEvent) {
     pendingLoginEvent = false;
     logEvent("LOGIN", pendingLoginDetail);
+    const PendingAuth &pa = pendingLoginAuth;
+    cloudLinkAccessEvent(currentTimestamp().c_str(), true, pa.email, pa.name, pa.role, pa.empId, pa.phoneId, "", 0);
   }
   if (pendingLogoutEvent) {
     pendingLogoutEvent = false;
@@ -3414,6 +3450,7 @@ void loop() {
     pendingLoginFailEvent = false;
     if (lastLoginFailLogMs == 0 || millis() - lastLoginFailLogMs >= LOGIN_FAIL_LOG_INTERVAL_MS) {
       String detail = pendingLoginFailDetail;
+      uint32_t suppressed = suppressedLoginFails;
       if (suppressedLoginFails > 0) {
         detail += " (+" + String((unsigned long)suppressedLoginFails) + " more failed attempts not logged)";
         suppressedLoginFails = 0;
@@ -3421,6 +3458,9 @@ void loop() {
       lastLoginFailLogMs = millis();
       if (lastLoginFailLogMs == 0) lastLoginFailLogMs = 1;
       logEvent("LOGIN_FAIL", detail);
+      const PendingAuth &pf = pendingLoginFailAuth;
+      cloudLinkAccessEvent(currentTimestamp().c_str(), false, pf.email, pf.name, pf.role, pf.empId, pf.phoneId,
+                           pf.reason, suppressed);
     } else {
       suppressedLoginFails++;
     }

@@ -2246,6 +2246,7 @@ document.getElementById('ota-status').innerHTML="<div class='alert alert-info'><
     html += kvItem("Phone sync", htmlEsc(String(fb.phoneState)));
     html += kvItem("User sync", htmlEsc(String(fb.userState)));
     html += kvItem("Network settings sync", htmlEsc(String(fb.networkState)));
+    html += kvItem("Event upload", htmlEsc(String(fb.eventState)));
     html += kvItem("Last sync check", fb.phoneEverOk ? String((unsigned long)fb.phoneLastOkAgoS) + " s ago" : String("None since boot"));
     html += "</dl></div>";
     html += "<div class='card'>";

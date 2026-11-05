@@ -25,6 +25,12 @@ struct CloudStatus {
   char     bleName[32];
   char     wifiSsid[32];
   bool     netRestartPending;   // new settings saved, applied at the next idle restart
+  // Event upload, filled by the network task (shown in the web app's Events & Logs).
+  char     evState[96];
+  uint32_t evQueued;     // waiting in the upload queue
+  uint32_t evUploaded;   // since boot
+  uint32_t evNoClock;    // not uploaded: the clock was not set when they happened
+  uint32_t evDropped;    // not uploaded: the queue was full (still on the SD card)
 };
 
 // Both return the length written, or 0 if it did not fit in `cap`.
@@ -232,3 +238,47 @@ size_t cloudBuildSyncRecord(char *out, size_t cap, const char *type, const char 
 // synchistory key: "YYYY-MM-DD_HH-MM-SS" from the PLC time, or "uptime-N"
 // while the clock is unset (the MA devices use the same keys).
 void cloudHistoryKey(const char *ts, unsigned long uptimeS, char *out, size_t cap);
+
+// ---- Event upload (the web app's "Events & Logs" section) ----
+// Every SD event-log line is also uploaded, and logins additionally as access
+// events (like the MA devices' rfid_events). One root PATCH writes both:
+//   bfa_logs/{deviceId}/{YYYY-MM}/{key}    {plc_ts, category, detail, skipped?}
+//   bfa_events/{deviceId}/{YYYY-MM}/{key}  {auth: 1|0, email, username, role,
+//                                           empId, phoneId, reason, plc_ts,
+//                                           suppressed?}
+// key = "YYYY-MM-DD_HH-MM-SS_NN": the event's PLC time plus a counter, so
+// events of the same second stay apart and the keys sort by time.
+// `skipped`: events before this one that were never uploaded (the upload
+// queue was full); they are still on the SD card.
+struct CloudLogEntry {
+  char     key[24];
+  char     ts[20];
+  char     category[20];
+  char     detail[128];
+  uint16_t skipped;
+};
+struct CloudAccessEntry {
+  char     key[24];
+  char     ts[20];
+  bool     authorized;
+  char     email[64];
+  char     name[64];
+  char     role[16];
+  char     empId[17];
+  char     phoneId[41];
+  char     reason[20];      // why it was refused ("" when authorized)
+  uint16_t suppressed;      // refused attempts not logged before this one
+};
+
+// The key for an event at `ts` ("YYYY-MM-DD HH:MM:SS"); false when `ts` is not
+// such a time (the clock is unset: the event stays on the SD card only).
+bool cloudEventKey(const char *ts, unsigned seq, char *out, size_t cap);
+
+// "/.json?auth={secret}": the database root, for a multi-path PATCH. 0 if the
+// secret is not valid or it did not fit.
+size_t cloudBuildRootPath(char *out, size_t cap, const char *secret);
+
+// The root PATCH for `nLogs` log lines and `nAcc` access events. 0 if it did
+// not fit in `cap` (send fewer).
+size_t cloudBuildEventsPatch(char *out, size_t cap, const char *deviceId, const CloudLogEntry *logs, int nLogs,
+                             const CloudAccessEntry *acc, int nAcc);

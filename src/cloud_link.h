@@ -65,6 +65,7 @@ struct FirebaseInfo {
   char     phoneState[96];
   char     userState[96];
   char     networkState[96];
+  char     eventState[96];    // event upload
   bool     phoneEverOk;       // any sync request succeeded
   uint32_t phoneLastOkAgoS;   // valid when phoneEverOk
 };
@@ -108,3 +109,14 @@ void cloudLinkPhoneChanged(const char *phoneId, const char *owner, bool removed)
 // From loop()'s task. Never sends the password.
 struct User;
 void cloudLinkUserChanged(const User *now, const char *removedEmail);
+
+// ---- Event upload (the web app's "Events & Logs" section) ----
+// Every SD event-log line (logEvent()) is also queued for bfa_logs, and every
+// BLE login for bfa_events (layout in cloud_wire.h). The network task uploads
+// them a few at a time. The queue is in RAM: if it fills while the database
+// cannot be reached, the oldest entries are dropped (they stay on the SD
+// card, and the next uploaded line says how many were skipped). Events with
+// no valid clock time are not uploaded. Cheap; from loop()'s task.
+void cloudLinkLogEvent(const char *ts, const char *category, const char *detail);
+void cloudLinkAccessEvent(const char *ts, bool authorized, const char *email, const char *name, const char *role,
+                          const char *empId, const char *phoneId, const char *reason, unsigned suppressed);

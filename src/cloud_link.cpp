@@ -76,7 +76,11 @@ static unsigned long lastOkMs       = 0;
 // Allocated only once a login is configured, so an unconfigured PLC keeps this
 // memory and never parses the certificates.
 struct Buffers {
+#ifdef CLOUD_PROJECT_ID
   char token[2048];
+#else
+  char token[1];   // no Firestore project in this build: never signed in, 2 KB more heap for TLS
+#endif
   char body[1536];
   char resp[4096];
 };
@@ -152,9 +156,34 @@ static UserChange    usOutbox[SY_OUTBOX];
 static int           usOutboxCount    = 0;
 static bool          usOutboxOverflow = false;
 
+// Event upload (see cloudLinkLogEvent()): two rings, filled by loop() and
+// emptied by the network task, under `mux`. Each entry has a running number;
+// `*First` is the number of the oldest entry still in the ring, so the network
+// task can tell what it has sent even if the ring overflowed meanwhile.
+// The rings live in RTC slow memory, not in DRAM: every byte of DRAM is heap
+// a TLS session needs (TLS_MIN_FREE_HEAP), and in DRAM these 5.4 KB kept the
+// heap below it. RTC slow memory is reachable from both cores, is otherwise
+// unused by this firmware, and is cleared at every boot like normal RAM.
+static const int   EV_LOG_RING  = 20;   // ~3.9 KB
+static const int   EV_ACC_RING  = 6;    // ~1.7 KB
+static const int   EV_LOG_BATCH = 4;    // per PATCH (fits mem->body)
+static const int   EV_ACC_BATCH = 2;
+RTC_DATA_ATTR static CloudLogEntry    evLogs[EV_LOG_RING];
+RTC_DATA_ATTR static CloudAccessEntry evAcc[EV_ACC_RING];
+static int          evLogHead = 0, evLogCount = 0;
+static int          evAccHead = 0, evAccCount = 0;
+static uint32_t     evLogFirst = 0, evAccFirst = 0;
+static uint32_t     evLogDropped = 0, evAccDropped = 0;   // lost to a full ring, not yet reported
+static uint32_t     evUploaded = 0;
+static uint32_t     evNoClock = 0;        // since boot: no valid clock time, not uploaded
+static uint32_t     evDroppedTotal = 0;   // since boot: lost to a full ring
+static char         evLogLastTs[20] = "", evAccLastTs[20] = "";
+static unsigned     evLogSeq = 0, evAccSeq = 0;
+
 static char          phState[96] = "Not started";
 static char          usState[96] = "Not started";
 static char          nwState[96] = "Not started";
+static char          evState[96] = "Not started";
 static bool          syEverOk    = false;
 static unsigned long syLastOkMs  = 0;
 
@@ -242,6 +271,13 @@ static void setNwState(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   setStateIn(nwState, sizeof(nwState), "NETSYNC", fmt, ap);
+  va_end(ap);
+}
+
+static void setEvState(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  setStateIn(evState, sizeof(evState), "EVENTS", fmt, ap);
   va_end(ap);
 }
 
@@ -448,6 +484,11 @@ static Outcome sendFirebasePush() {
   taskENTER_CRITICAL(&mux);
   s = sharedStatus;
   fbLiveDirty = false;   // this push carries the latest change
+  memcpy(s.evState, evState, sizeof(s.evState));
+  s.evQueued   = (uint32_t)(evLogCount + evAccCount);
+  s.evUploaded = evUploaded;
+  s.evNoClock  = evNoClock;
+  s.evDropped  = evDroppedTotal;
   taskEXIT_CRITICAL(&mux);
   strlcpy(s.ip, Ethernet.localIP().toString().c_str(), sizeof(s.ip));
   s.uptimeS     = (uint32_t)(esp_timer_get_time() / 1000000LL);
@@ -874,6 +915,166 @@ static PhRes flushUserOutbox() {
   return PhRes::Ok;
 }
 
+// ---- event upload ----
+
+static bool eventsWaiting() {
+  taskENTER_CRITICAL(&mux);
+  bool w = evLogCount > 0 || evAccCount > 0;
+  taskEXIT_CRITICAL(&mux);
+  return w;
+}
+
+// Takes `n` entries off the front of a ring, but only those still there: if
+// it overflowed meanwhile, the oldest ones were already dropped.
+static void ringPop(int &head, int &count, uint32_t &first, int size, uint32_t sentFrom, int n) {
+  uint32_t end = sentFrom + (uint32_t)n;   // one past the last entry sent
+  while (count > 0 && first < end) {
+    head = (head + 1) % size;
+    count--;
+    first++;
+  }
+}
+
+// Uploads a few queued events in one root PATCH (bfa_logs + bfa_events).
+static PhRes flushEvents() {
+  CloudLogEntry    *logs = static_cast<CloudLogEntry *>(malloc(sizeof(CloudLogEntry) * EV_LOG_BATCH));
+  CloudAccessEntry *acc  = static_cast<CloudAccessEntry *>(malloc(sizeof(CloudAccessEntry) * EV_ACC_BATCH));
+  if (!logs || !acc) {
+    free(logs);
+    free(acc);
+    return PhRes::Heap;
+  }
+
+  int nL, nA;
+  uint32_t logFrom, accFrom, skipped;
+  taskENTER_CRITICAL(&mux);
+  nL = evLogCount < EV_LOG_BATCH ? evLogCount : EV_LOG_BATCH;
+  nA = evAccCount < EV_ACC_BATCH ? evAccCount : EV_ACC_BATCH;
+  for (int i = 0; i < nL; i++) logs[i] = evLogs[(evLogHead + i) % EV_LOG_RING];
+  for (int i = 0; i < nA; i++) acc[i] = evAcc[(evAccHead + i) % EV_ACC_RING];
+  logFrom = evLogFirst;
+  accFrom = evAccFirst;
+  skipped = evLogDropped + evAccDropped;
+  taskEXIT_CRITICAL(&mux);
+
+  if (nL > 0 && skipped) logs[0].skipped = skipped > 0xFFFF ? 0xFFFF : (uint16_t)skipped;
+  size_t len;
+  while ((len = cloudBuildEventsPatch(mem->body, sizeof(mem->body), fb.deviceId, logs, nL, acc, nA)) == 0 &&
+         nL + nA > 1) {
+    if (nL >= nA && nL > 0) nL--;   // send fewer: the rest go next time
+    else nA--;
+  }
+
+  PhRes r = PhRes::Ok;
+  int status = 0;
+  const char *stage = "";
+  if (len == 0) {
+    status = 400;   // one entry alone does not fit (cannot happen with these sizes): drop it
+  } else if (!tlsHeapOk()) {
+    r = PhRes::Heap;
+  } else {
+    char path[96];   // holds the secret: keep it off the heap and out of every log
+    if (cloudBuildRootPath(path, sizeof(path), fb.secret) == 0) {
+      stage  = "building the request";
+      status = 0;
+    } else {
+      status = httpsRequest("PATCH", fbHost, path, nullptr, mem->body, stage);
+    }
+    memset(path, 0, sizeof(path));
+  }
+  free(logs);
+  free(acc);
+  if (r != PhRes::Ok) return r;
+
+  if (status == 200 || status == 400) {
+    uint32_t total;
+    taskENTER_CRITICAL(&mux);
+    ringPop(evLogHead, evLogCount, evLogFirst, EV_LOG_RING, logFrom, nL);
+    ringPop(evAccHead, evAccCount, evAccFirst, EV_ACC_RING, accFrom, nA);
+    if (status == 200 && nL > 0 && skipped) {   // the gap is now on record
+      uint32_t fromLogs = skipped < evLogDropped ? skipped : evLogDropped;
+      evLogDropped -= fromLogs;
+      uint32_t rest = skipped - fromLogs;
+      evAccDropped -= rest < evAccDropped ? rest : evAccDropped;
+    }
+    if (status == 200) evUploaded += (uint32_t)(nL + nA);
+    total = evUploaded;
+    taskEXIT_CRITICAL(&mux);
+    if (status == 200) {
+      syMarkOk();
+      setEvState("Uploaded %lu event(s) since boot", (unsigned long)total);
+    } else {
+      setEvState("The database refused %d event(s) (HTTP 400); dropped", nL + nA);
+    }
+    return PhRes::Ok;
+  }
+  return syFailed(setEvState, "Uploading events", status, stage);
+}
+
+// Next key for an event at `ts`: same second as the last one, next counter.
+static bool nextEventKey(const char *ts, char *lastTs, unsigned &seq, char *key, size_t cap) {
+  if (strcmp(ts, lastTs) == 0) {
+    seq++;
+  } else {
+    seq = 0;
+    strlcpy(lastTs, ts, 20);
+  }
+  return cloudEventKey(ts, seq, key, cap);
+}
+
+void cloudLinkLogEvent(const char *ts, const char *category, const char *detail) {
+  if (!ts || !category) return;
+  CloudLogEntry e = {};
+  strlcpy(e.ts, ts, sizeof(e.ts));
+  strlcpy(e.category, category, sizeof(e.category));
+  strlcpy(e.detail, detail ? detail : "", sizeof(e.detail));
+  taskENTER_CRITICAL(&mux);
+  bool on = fbSaved.enabled && nextEventKey(e.ts, evLogLastTs, evLogSeq, e.key, sizeof(e.key));
+  if (fbSaved.enabled && !on) evNoClock++;
+  if (on) {
+    if (evLogCount == EV_LOG_RING) {   // full: the oldest goes (it is on the SD card)
+      evLogHead = (evLogHead + 1) % EV_LOG_RING;
+      evLogCount--;
+      evLogFirst++;
+      evLogDropped++;
+      evDroppedTotal++;
+    }
+    evLogs[(evLogHead + evLogCount) % EV_LOG_RING] = e;
+    evLogCount++;
+  }
+  taskEXIT_CRITICAL(&mux);
+}
+
+void cloudLinkAccessEvent(const char *ts, bool authorized, const char *email, const char *name, const char *role,
+                          const char *empId, const char *phoneId, const char *reason, unsigned suppressed) {
+  if (!ts) return;
+  CloudAccessEntry e = {};
+  strlcpy(e.ts, ts, sizeof(e.ts));
+  e.authorized = authorized;
+  strlcpy(e.email, email ? email : "", sizeof(e.email));
+  strlcpy(e.name, name ? name : "", sizeof(e.name));
+  strlcpy(e.role, role ? role : "", sizeof(e.role));
+  strlcpy(e.empId, empId ? empId : "", sizeof(e.empId));
+  strlcpy(e.phoneId, phoneId ? phoneId : "", sizeof(e.phoneId));
+  strlcpy(e.reason, reason ? reason : "", sizeof(e.reason));
+  e.suppressed = suppressed > 0xFFFF ? 0xFFFF : (uint16_t)suppressed;
+  taskENTER_CRITICAL(&mux);
+  bool on = fbSaved.enabled && nextEventKey(e.ts, evAccLastTs, evAccSeq, e.key, sizeof(e.key));
+  if (fbSaved.enabled && !on) evNoClock++;
+  if (on) {
+    if (evAccCount == EV_ACC_RING) {
+      evAccHead = (evAccHead + 1) % EV_ACC_RING;
+      evAccCount--;
+      evAccFirst++;
+      evAccDropped++;
+      evDroppedTotal++;
+    }
+    evAcc[(evAccHead + evAccCount) % EV_ACC_RING] = e;
+    evAccCount++;
+  }
+  taskEXIT_CRITICAL(&mux);
+}
+
 // ---- the queues ----
 
 struct QueueSpec {
@@ -1154,7 +1355,7 @@ static bool outboxWaiting(bool phones) {
 
 static bool syncDue(unsigned long now) {
   if ((long)(now - syNextWorkMs) < 0) return false;
-  bool out = outboxWaiting(true) | outboxWaiting(false);
+  bool out = outboxWaiting(true) | outboxWaiting(false) | eventsWaiting();
   return syReconcilePhones || syReconcileUsers || out || syClearFlag || phRun.pending || usRun.pending || syNetPending ||
          (long)(now - syNextPollMs) >= 0;
 }
@@ -1162,7 +1363,13 @@ static bool syncDue(unsigned long now) {
 // One job per call, so the heartbeat is never held up for long.
 static void syncStep() {
   PhRes r;
-  if (syReconcilePhones) {
+  // Every other turn goes to the event upload first, so events are not held
+  // up behind a list comparison or a queue that keeps failing.
+  static bool eventsTurn = false;
+  eventsTurn = !eventsTurn;
+  if (eventsTurn && eventsWaiting()) {
+    r = flushEvents();
+  } else if (syReconcilePhones) {
     r = reconcile(PHONE_LIST);
     if (r == PhRes::Ok) syReconcilePhones = false;
   } else if (syReconcileUsers) {
@@ -1172,6 +1379,8 @@ static void syncStep() {
     r = flushPhoneOutbox();
   } else if (outboxWaiting(false)) {
     r = flushUserOutbox();
+  } else if (eventsWaiting()) {
+    r = flushEvents();
   } else if (syClearFlag) {
     // Cleared before the queues are read: anything queued from now on sets it again.
     if (!tlsHeapOk()) {
@@ -1280,6 +1489,7 @@ static void cloudStep() {
     setPhState("Off: Firebase push is not enabled");
     setUsState("Off: Firebase push is not enabled");
     setNwState("Off: Firebase push is not enabled");
+    setEvState("Off: Firebase push is not enabled");
   }
   if (!fsOn && !fbOn) return;
 
@@ -1291,6 +1501,7 @@ static void cloudStep() {
       setPhState("%s", msg);
       setUsState("%s", msg);
       setNwState("%s", msg);
+      setEvState("%s", msg);
     }
   };
 
@@ -1553,6 +1764,7 @@ void cloudLinkGetFirebase(FirebaseSettings &cfg, FirebaseInfo &info) {
   strlcpy(info.phoneState, phState, sizeof(info.phoneState));
   strlcpy(info.userState, usState, sizeof(info.userState));
   strlcpy(info.networkState, nwState, sizeof(info.networkState));
+  strlcpy(info.eventState, evState, sizeof(info.eventState));
   info.phoneEverOk     = syEverOk;
   info.phoneLastOkAgoS = syEverOk ? (millis() - syLastOkMs) / 1000UL : 0;
   taskEXIT_CRITICAL(&mux);
