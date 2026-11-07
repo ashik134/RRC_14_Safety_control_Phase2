@@ -721,7 +721,9 @@ Main features
 
  /motion/status JSON
    {"estop":0|1,"up":..,"down":..,"left":..,"right":..,
-    "ble_conn":0|1,"ble_auth":0|1,"ble_user":"<name>"}
+    "ble_adv":0|1,"ble_conn":0|1,"ble_auth":0|1,"ble_user":"<name>"}
+   ble_adv is 1 while BLE is advertising (a phone can find the PLC). Only one
+   phone can connect, so it is 0 while one is connected.
    Values follow the pin-motion config. Note: for "estop" the web reports
    1 when the E-STOP output is ENERGISED/ON (i.e. motionEstop == false),
    per the code (estopOutputOn = motionEstop ? 0 : 1).
@@ -887,9 +889,10 @@ Main features
      https://<database host>/devices/<Device ID>.json?auth=<secret>
  with heartbeat (PLC-local "YYYY-MM-DD HH:MM:SS", left out while the clock is
  unset), heartbeatIntervalSec (60), fw, localIp and a status object (uptimeS,
- freeHeap, minFreeHeap, rtcOk, sdOk, estop, up, down, left, right, bleConn,
- bleAuth, bleUser). When a field the web app's Overview shows live changes
- (motion, E-STOP, the BLE connection and user, SD, RTC, a pending network
+ freeHeap, minFreeHeap, rtcOk, sdOk, estop, up, down, left, right, bleAdv,
+ bleConn, bleAuth, bleUser; bleAdv is true while BLE is advertising). When a
+ field the web app's Overview shows live changes (motion, E-STOP, BLE
+ advertising, the BLE connection and user, SD, RTC, a pending network
  restart), the same PATCH is sent early, at most once every 5 s, so the
  Overview follows within a few seconds instead of up to a minute. PATCH
  only merges, so what the web app keeps under devices/<id> is never removed.

@@ -18,6 +18,7 @@ struct CloudStatus {
   bool     sdOk;
   bool     estop;         // true while the E-STOP is engaged (firmware's motionEstop)
   bool     up, down, left, right;
+  bool     bleAdv;        // BLE is broadcasting: a phone can find the PLC (firmware's bleAdvertising)
   bool     bleConn;
   bool     bleAuth;
   char     bleUser[64];

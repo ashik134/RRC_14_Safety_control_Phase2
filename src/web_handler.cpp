@@ -775,6 +775,8 @@ body.busy .busy-line{display:block}
 .pill-wait .dot{background:var(--warn);box-shadow:0 0 0 4px rgba(234,88,12,.2);animation:pulse 1.2s ease-in-out infinite}
 .pill-off{background:#F1F5F9;color:var(--soft)}
 .pill-off .dot{background:#94A3B8}
+.pill-adv{background:#EFF6FF;color:var(--brand-dark)}
+.pill-adv .dot{background:var(--brand);box-shadow:0 0 0 4px rgba(21,101,192,.2);animation:pulse 1.6s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.35}}
 .motion-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
 .mot{display:flex;flex-direction:column;align-items:center;gap:6px;padding:13px 4px;border:1px solid var(--line);border-radius:12px;background:var(--tint);color:var(--faint);font-size:12px;font-weight:700;letter-spacing:.05em;transition:background .2s,color .2s,box-shadow .2s}
@@ -1295,11 +1297,11 @@ if(t!==__currentTab)showTab(t,true);});
 // on a full page load and when the panel is swapped in as an AJAX fragment.
 static const char HOME_JS[] = R"JS(
 function updateHomeUI(s){
-var st=(s.ble_conn===1&&s.ble_auth===1)?'on':(s.ble_conn===1?'wait':'off');
+var st=(s.ble_conn===1&&s.ble_auth===1)?'on':(s.ble_conn===1?'wait':(s.ble_adv===1?'adv':'off'));
 var bc=document.getElementById('hble-conn'),bt=document.getElementById('hble-txt');
 var bu=document.getElementById('hble-user'),bn=document.getElementById('hble-uname');
 if(bc)bc.className='pill pill-'+st;
-if(bt)bt.textContent=st==='on'?'Connected':(st==='wait'?'Authenticating...':'Not connected');
+if(bt)bt.textContent=st==='on'?'Connected':(st==='wait'?'Authenticating...':(st==='adv'?'Advertising, ready to connect':'Not advertising'));
 if(bu){bu.hidden=st!=='on';if(bn)bn.textContent=s.ble_user||'Unknown';}
 var m={estop:s.estop,up:s.up,down:s.down,left:s.left,right:s.right};
 for(var k in m){var el=document.getElementById('m-'+k);if(el)el.classList.toggle('on',m[k]===1);}
@@ -1986,6 +1988,11 @@ static void handleRoot()
       {
         state = "wait";
         bleLabel = "Authenticating...";
+      }
+      else if (bleAdvertising)
+      {
+        state = "adv";
+        bleLabel = "Advertising, ready to connect";
       }
       else
       {
@@ -3662,6 +3669,7 @@ static void handleMotionStatus()
                 ",\"down\":" + String(downOutputOn) +
                 ",\"left\":" + String(leftOutputOn) +
                 ",\"right\":" + String(rightOutputOn) +
+                ",\"ble_adv\":" + String(bleAdvertising ? 1 : 0) +
                 ",\"ble_conn\":" + String(deviceConnected ? 1 : 0) +
                 ",\"ble_auth\":" + String(authenticated ? 1 : 0) +
                 ",\"ble_user\":\"" + bleUserName + "\"}";

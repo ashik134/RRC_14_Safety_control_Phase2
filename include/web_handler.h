@@ -48,6 +48,7 @@ extern Preferences prefs;
 // BLE connection state — defined in main.cpp
 extern bool deviceConnected;
 extern bool authenticated;
+extern bool bleAdvertising;   // true while BLE is broadcasting (a phone can find the PLC)
 extern char connectedUserEmail[64];
 
 // Current motion output state — defined in main.cpp, updated by BLE callback

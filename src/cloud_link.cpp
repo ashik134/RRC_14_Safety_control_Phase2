@@ -115,7 +115,7 @@ static bool                fbLiveDirty    = false;   // under `mux`
 
 static bool liveFieldsDiffer(const CloudStatus &a, const CloudStatus &b) {
   return a.estop != b.estop || a.up != b.up || a.down != b.down || a.left != b.left || a.right != b.right ||
-         a.bleConn != b.bleConn || a.bleAuth != b.bleAuth || strcmp(a.bleUser, b.bleUser) != 0 || a.sdOk != b.sdOk ||
+         a.bleAdv != b.bleAdv || a.bleConn != b.bleConn || a.bleAuth != b.bleAuth || strcmp(a.bleUser, b.bleUser) != 0 || a.sdOk != b.sdOk ||
          a.rtcOk != b.rtcOk || a.netRestartPending != b.netRestartPending;
 }
 

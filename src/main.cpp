@@ -871,6 +871,11 @@ NimBLECharacteristic *heartbeatChar = nullptr;
 
 bool     deviceConnected  = false;
 bool     authenticated    = false;
+// True while the PLC is broadcasting BLE advertisements, i.e. a phone can find
+// it. Read from NimBLE every loop() (updateBleAdvertising()), so it also shows
+// when advertising failed to restart. Only one phone can connect, so NimBLE
+// stops advertising while one is connected.
+bool     bleAdvertising   = false;
 bool     sessionJson      = false;   // the signed-in app logged in with a JSON (blep v1) message: unprompted notifications use JSON too
 char     connectedUserEmail[64] = "";
 uint16_t connId           = 0;        
@@ -3296,6 +3301,7 @@ static void publishCloudStatus() {
   s.down    = motionDown;
   s.left    = motionLeft;
   s.right   = motionRight;
+  s.bleAdv  = bleAdvertising;
   s.bleConn = deviceConnected;
   s.bleAuth = authenticated;
   strlcpy(s.bleUser, connectedUserEmail, sizeof(s.bleUser));
@@ -3330,11 +3336,21 @@ static void restartForNetworkWhenIdle() {
   ESP.restart();
 }
 
+// Refreshes bleAdvertising from NimBLE's own state. Logs each change.
+static void updateBleAdvertising() {
+  bool adv = NimBLEDevice::getAdvertising()->isAdvertising();
+  if (adv != bleAdvertising) {
+    bleAdvertising = adv;
+    Serial.printf("BLE advertising %s\n", adv ? "ON" : "OFF");
+  }
+}
+
 void loop() {
 
   // Sample I0.1 and refresh motionEstop every cycle, regardless of BLE
   // connection state, so the physical interlock is always live.
   updateEstopState();
+  updateBleAdvertising();
 
   if (deviceConnected) {
 

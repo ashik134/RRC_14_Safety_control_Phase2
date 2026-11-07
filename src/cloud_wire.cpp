@@ -236,6 +236,8 @@ size_t cloudBuildHeartbeat(char *out, size_t cap, const char *projectId, const c
 
   o.field("ble");
   o.raw("{\"mapValue\":{\"fields\":{");
+  o.boolValue("adv", s.bleAdv);
+  o.raw(",");
   o.boolValue("conn", s.bleConn);
   o.raw(",");
   o.boolValue("auth", s.bleAuth);
@@ -461,6 +463,8 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.plainBool("left", s.left);
   o.raw(",");
   o.plainBool("right", s.right);
+  o.raw(",");
+  o.plainBool("bleAdv", s.bleAdv);
   o.raw(",");
   o.plainBool("bleConn", s.bleConn);
   o.raw(",");
