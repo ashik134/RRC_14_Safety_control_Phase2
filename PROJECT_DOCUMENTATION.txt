@@ -888,7 +888,8 @@ Main features
  60 s the cloud task then sends a PATCH to
      https://<database host>/devices/<Device ID>.json?auth=<secret>
  with heartbeat (PLC-local "YYYY-MM-DD HH:MM:SS", left out while the clock is
- unset), heartbeatIntervalSec (60), fw, localIp and a status object (uptimeS,
+ unset), heartbeatIntervalSec (60), fw, localIp, mac (Ethernet MAC), bleMac
+ (BLE address phones see) and a status object (uptimeS,
  freeHeap, minFreeHeap, rtcOk, sdOk, estop, up, down, left, right, bleAdv,
  bleConn, bleAuth, bleUser; bleAdv is true while BLE is advertising). When a
  field the web app's Overview shows live changes (motion, E-STOP, BLE

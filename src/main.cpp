@@ -3301,6 +3301,11 @@ static void publishCloudStatus() {
   s.down    = motionDown;
   s.left    = motionLeft;
   s.right   = motionRight;
+  // MACs never change while running; ethDiagGetMac() is a pure calculation, so
+  // it is safe here, and the BLE address is fixed once NimBLEDevice::init() ran.
+  ethDiagGetMac(s.mac, sizeof(s.mac));
+  strlcpy(s.bleMac, NimBLEDevice::getAddress().toString().c_str(), sizeof(s.bleMac));
+  for (char *c = s.bleMac; *c; c++) *c = toupper((unsigned char)*c);
   s.bleAdv  = bleAdvertising;
   s.bleConn = deviceConnected;
   s.bleAuth = authenticated;

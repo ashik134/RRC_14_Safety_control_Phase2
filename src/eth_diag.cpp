@@ -101,6 +101,18 @@ static uint8_t w5500RawRead8(uint16_t addr) {
   return v;
 }
 
+// Locally-administered MAC derived from the ESP32 eFuse MAC. Fixed for the
+// board's life, so ethDiagGetMac() can report it without waiting for init.
+static void deriveEthMac(uint8_t *m) {
+  uint64_t efuse = ESP.getEfuseMac();
+  m[0] = 0x02;
+  m[1] = (uint8_t)(efuse >> 0);
+  m[2] = (uint8_t)(efuse >> 8);
+  m[3] = (uint8_t)(efuse >> 16);
+  m[4] = (uint8_t)(efuse >> 24);
+  m[5] = (uint8_t)(efuse >> 32);
+}
+
 static void printMac(const uint8_t *m) {
   Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
@@ -278,13 +290,7 @@ void ethDiagInit() {
 
   // Locally-administered MAC derived from the ESP32 eFuse MAC: unique per
   // board, no collision with a real vendor OUI.
-  uint64_t efuse = ESP.getEfuseMac();
-  ethMac[0] = 0x02;
-  ethMac[1] = (uint8_t)(efuse >> 0);
-  ethMac[2] = (uint8_t)(efuse >> 8);
-  ethMac[3] = (uint8_t)(efuse >> 16);
-  ethMac[4] = (uint8_t)(efuse >> 24);
-  ethMac[5] = (uint8_t)(efuse >> 32);
+  deriveEthMac(ethMac);
 
   // Test 2: the Ethernet library's own init (soft reset, MR write/readback
   // pattern test, chip-ID check), then program MAC + static IP.
@@ -453,11 +459,18 @@ bool ethDiagStartDhcp() {
 
 EthDiagStatus ethDiagGetStatus() { return st; }
 
+void ethDiagGetMac(char *out, size_t cap) {
+  uint8_t m[6];
+  deriveEthMac(m);
+  snprintf(out, cap, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
 #else  // ETH_DIAG_ENABLED == 0
 
 void ethDiagInit() {}
 void ethDiagPoll() {}
 bool ethDiagStartDhcp() { return false; }
 EthDiagStatus ethDiagGetStatus() { return EthDiagStatus{false, 0, false, false, false}; }
+void ethDiagGetMac(char *out, size_t cap) { if (cap) out[0] = ' '; }
 
 #endif

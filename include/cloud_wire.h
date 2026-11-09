@@ -10,6 +10,8 @@
 // main.cpp) except ip and uptimeS, which the network task adds.
 struct CloudStatus {
   char     ip[16];
+  char     mac[18];       // Ethernet (W5500) MAC "AA:BB:CC:DD:EE:FF"
+  char     bleMac[18];    // BLE address phones see when scanning
   uint32_t uptimeS;
   uint32_t freeHeap;      // bytes, at the moment of the push (network task)
   uint32_t minFreeHeap;   // lowest since boot

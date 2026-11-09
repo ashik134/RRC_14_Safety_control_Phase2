@@ -203,6 +203,10 @@ size_t cloudBuildHeartbeat(char *out, size_t cap, const char *projectId, const c
   o.raw(",");
   o.stringValue("ip", s.ip);
   o.raw(",");
+  o.stringValue("mac", s.mac);
+  o.raw(",");
+  o.stringValue("bleMac", s.bleMac);
+  o.raw(",");
   char uptime[12];
   snprintf(uptime, sizeof(uptime), "%lu", (unsigned long)s.uptimeS);
   o.field("uptimeS");
@@ -440,6 +444,10 @@ size_t cloudBuildDeviceUpdate(char *out, size_t cap, const char *fw, unsigned he
   o.plainString("fw", fw);
   o.raw(",");
   o.plainString("localIp", s.ip);
+  o.raw(",");
+  o.plainString("mac", s.mac);
+  o.raw(",");
+  o.plainString("bleMac", s.bleMac);
   o.raw(",");
 
   o.field("status");

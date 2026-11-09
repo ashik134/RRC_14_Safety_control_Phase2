@@ -33,3 +33,4 @@ void ethDiagInit();
 void ethDiagPoll();
 bool ethDiagStartDhcp();   // true = lease obtained; false = back on the static address
 EthDiagStatus ethDiagGetStatus();
+void ethDiagGetMac(char *out, size_t cap);   // Ethernet MAC "AA:BB:CC:DD:EE:FF" (cap >= 18); empty when disabled
