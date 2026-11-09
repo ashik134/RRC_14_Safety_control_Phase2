@@ -16,6 +16,7 @@
 #include "password_hash.h"  // stored user passwords are PBKDF2 hashes
 #include "spi_bus_switch.h" // GPIO4 picks the SD card or the W5500 on the shared bus
 #include "esp_log.h"
+#include "esp_system.h"     // esp_reset_reason() for the BOOT event
 #include <time.h>
 #include <vector>
 #include <string>
@@ -839,6 +840,46 @@ struct PendingAuth {
 };
 PendingAuth pendingLoginAuth     = {};
 PendingAuth pendingLoginFailAuth = {};
+
+// Who is signed in right now, kept in flash. onDisconnect() never runs when the
+// PLC itself resets (power loss, crash, watchdog, reflash), so the RAM copy of
+// the session is gone by then and the LOGOUT could not be written. This copy
+// survives the reset: setup() reads it, logs the LOGOUT that never happened, and
+// clears it. Its own namespace (and handle) so it never disturbs `prefs`.
+// Called from loop() only: a flash write does not belong in the BLE task.
+static void sessionRecord(const char *email, const char *name) {
+  Preferences sp;
+  if (!sp.begin("session", false)) return;
+  if (sp.getString("email", "") != email || sp.getString("name", "") != name) {
+    sp.putString("email", email);
+    sp.putString("name", name);
+  }
+  sp.end();
+}
+static void sessionForget() {
+  Preferences sp;
+  if (!sp.begin("session", false)) return;
+  if (sp.isKey("email")) {
+    sp.remove("email");
+    sp.remove("name");
+  }
+  sp.end();
+}
+// Reset cause in a few words, for the LOGOUT line ("PLC power loss").
+static const char *shortResetReason(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "power loss";
+    case ESP_RST_SW:        return "restart";
+    case ESP_RST_PANIC:     return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_EXT:       return "reset";
+    case ESP_RST_DEEPSLEEP: return "sleep wake";
+    default:                return "unknown cause";
+  }
+}
 
 void forceAllOutputsOff() {
   I2CGuard _i2cGuard;
@@ -3281,6 +3322,40 @@ void setup() {
 
   // Last in boot. With a login stored, the cloud_link task takes over the W5500.
   cloudLinkBegin();
+
+  // A reboot (power loss, reflash, crash, OTA) never runs onDisconnect(), so a
+  // user who was logged in gets no LOGOUT. The session was recorded in flash at
+  // login (sessionRecord()), so the LOGOUT is written here, ahead of the BOOT
+  // entry, with the reset cause in a few words. Same format as a normal LOGOUT
+  // plus " - PLC <cause>", so the web app pairs it with the LOGIN.
+  // After cloudLinkBegin() so the events also reach the web app's log.
+  {
+    Preferences sp;
+    if (sp.begin("session", true)) {
+      String email = sp.getString("email", "");
+      String name  = sp.getString("name", "");
+      sp.end();
+      if (email.length() > 0) {
+        logEvent("LOGOUT", (name.length() ? name : email) + " (" + email + ") logged out - PLC " +
+                           shortResetReason(esp_reset_reason()));
+        sessionForget();
+      }
+    }
+  }
+  const char *resetReason;
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   resetReason = "power-on";                break;
+    case ESP_RST_SW:        resetReason = "software restart";        break;
+    case ESP_RST_PANIC:     resetReason = "crash (panic)";           break;
+    case ESP_RST_INT_WDT:   resetReason = "interrupt watchdog";      break;
+    case ESP_RST_TASK_WDT:  resetReason = "task watchdog";           break;
+    case ESP_RST_WDT:       resetReason = "watchdog";                break;
+    case ESP_RST_BROWNOUT:  resetReason = "brownout";                break;
+    case ESP_RST_EXT:       resetReason = "external reset";          break;
+    case ESP_RST_DEEPSLEEP: resetReason = "deep sleep wake";         break;
+    default:                resetReason = "unknown";                 break;
+  }
+  logEvent("BOOT", String("PLC started, reset reason: ") + resetReason);
 }
 
 // Hands the cloud task a snapshot of the state it reports, once a second. The
@@ -3456,10 +3531,12 @@ void loop() {
     logEvent("LOGIN", pendingLoginDetail);
     const PendingAuth &pa = pendingLoginAuth;
     cloudLinkAccessEvent(currentTimestamp().c_str(), true, pa.email, pa.name, pa.role, pa.empId, pa.phoneId, "", 0);
+    sessionRecord(pa.email, pa.name);   // so a reset can still log this user out
   }
   if (pendingLogoutEvent) {
     pendingLogoutEvent = false;
     logEvent("LOGOUT", pendingLogoutDetail);
+    sessionForget();
   }
   // Failed logins: at most one SD entry per LOGIN_FAIL_LOG_INTERVAL_MS, so a
   // client retrying in a loop can't flood or fill the card. Attempts skipped
